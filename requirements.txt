@@ -1,0 +1,20 @@
+# ============================================================
+#  Universal Media Downloader Bot - Requirements
+#  Install: pip install -r requirements.txt
+# ============================================================
+
+# Telegram Bot API wrapper
+pyTelegramBotAPI>=4.22.0
+
+# Video/audio downloading engine
+yt-dlp>=2024.12.0
+
+# Environment variable management
+python-dotenv>=1.0.0
+
+# SOCKS proxy support for telebot (needed for socks5 proxies)
+# Install with: pip install requests[socks]
+requests[socks]>=2.31.0
+
+# Optional: faster downloads via aria2
+# aria2p>=0.12.0
