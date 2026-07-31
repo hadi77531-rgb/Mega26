@@ -373,20 +373,10 @@ def build_ydl_opts(
         else:
             opts["format"] = "bestaudio[ext=m4a]/bestaudio"
     else:
-        # Video: robust format selection with many fallbacks
-        # Some videos don't have matching height — always end with 'best'
-        height = quality
-        opts["format"] = (
-            f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
-            f"bestvideo[height<={height}]+bestaudio/"
-            f"bestvideo[height<={height}]/"
-            f"bestvideo+bestaudio/"
-            f"best[height<={height}]/"
-            f"bestvideo/best"
-        )
+        # Video: use 'best' — never fails with "format not available"
+        # yt-dlp picks the best available format automatically
+        opts["format"] = "best"
         opts["merge_output_format"] = "mp4"
-        # Don't fail if no exact format match — fall through to best
-        opts["ignore_no_formats_error"] = True
 
     opts["progress_hooks"] = []  # injected per-download
     return opts
