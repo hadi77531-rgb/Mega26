@@ -373,13 +373,20 @@ def build_ydl_opts(
         else:
             opts["format"] = "bestaudio[ext=m4a]/bestaudio"
     else:
-        # Video: smart format selection
+        # Video: robust format selection with many fallbacks
+        # Some videos don't have matching height — always end with 'best'
         height = quality
         opts["format"] = (
+            f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
             f"bestvideo[height<={height}]+bestaudio/"
-            f"best[height<={height}]/best"
+            f"bestvideo[height<={height}]/"
+            f"bestvideo+bestaudio/"
+            f"best[height<={height}]/"
+            f"bestvideo/best"
         )
         opts["merge_output_format"] = "mp4"
+        # Don't fail if no exact format match — fall through to best
+        opts["ignore_no_formats_error"] = True
 
     opts["progress_hooks"] = []  # injected per-download
     return opts
