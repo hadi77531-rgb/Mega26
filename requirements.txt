@@ -1,4 +1,4 @@
 pyTelegramBotAPI>=4.0.0
 python-dotenv>=1.0.0
-"yt-dlp[default]>=2026.7.4"
+yt-dlp[default]>=2026.7.4
 bgutil-ytdlp-pot-provider>=1.0.0

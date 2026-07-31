@@ -15,12 +15,6 @@ ENV PATH="$DENO_INSTALL/bin:$PATH"
 RUN curl -fsSL https://deno.land/install.sh | sh -s v2.9.2
 RUN deno --version
 
-# Install yt-dlp with [default] extra (installs yt-dlp-ejs JS runtime)
-RUN pip install --no-cache-dir "yt-dlp[default]>=2026.7.4"
-
-# Install PO Token provider
-RUN pip install --no-cache-dir bgutil-ytdlp-pot-provider
-
 # Clone bgutil PO Token server
 RUN git clone --single-branch --branch 1.3.1 \
     https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git \
