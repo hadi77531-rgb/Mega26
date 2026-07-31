@@ -4,7 +4,7 @@
   Universal Media Downloader - Telegram Bot (2026 Edition)
 ============================================================
 Supports: YouTube, Instagram, TikTok, Twitter/X, and 1000+ sites
-Powered by: yt-dlp + pyTelegramBotAPI
+Powered by: yt-dlp + pyTelegramBotAPI + bgutil PO Token
 ============================================================
 """
 
@@ -16,6 +16,7 @@ import shutil
 import logging
 import tempfile
 import threading
+import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
@@ -58,7 +59,6 @@ if PROXY_ENABLED:
     if PROXY_HTTPS:
         proxy_dict["https"] = PROXY_HTTPS
 
-    # Test if proxy is actually reachable before committing to it
     try:
         import socket as _proxy_socket
         from urllib.parse import urlparse as _proxy_urlparse
@@ -94,7 +94,6 @@ COOKIE_FILE: str = os.path.expanduser(
 )
 
 # --- YouTube Cookies from environment variable (for Railway/cloud) ---
-# Set YOUTUBE_COOKIES env var with the full Netscape cookie text
 YOUTUBE_COOKIES_TEXT: str = os.getenv("YOUTUBE_COOKIES", "")
 _cookie_temp_file: Optional[str] = None
 
@@ -109,6 +108,9 @@ if YOUTUBE_COOKIES_TEXT:
         print(f"YouTube cookies loaded from YOUTUBE_COOKIES env var -> {_cookie_temp_file}")
     except Exception as _e:
         print(f"WARNING: Failed to write cookie temp file: {_e}")
+
+# --- PO Token Server URL (bgutil HTTP server) ---
+PO_TOKEN_SERVER_URL: str = os.getenv("PO_TOKEN_SERVER_URL", "")
 
 # --- Limits ---
 MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
@@ -157,7 +159,6 @@ else:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# Ensure webhook is removed for polling
 try:
     bot.remove_webhook()
 except Exception:
@@ -175,7 +176,6 @@ _rate_lock = threading.Lock()
 
 
 def cleanup_stale_states(max_age_seconds: int = 1800) -> None:
-    """Remove user states older than max_age_seconds (default 30 min)."""
     now = datetime.now()
     with _states_lock:
         stale = [
@@ -196,7 +196,6 @@ def cleanup_stale_states(max_age_seconds: int = 1800) -> None:
 
 
 def check_rate_limit(chat_id: int) -> bool:
-    """Return True if user is within rate limit, False if throttled."""
     now = datetime.now()
     with _rate_lock:
         if chat_id not in rate_limit_map:
@@ -235,7 +234,6 @@ GENERIC_URL = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 
 
 def validate_url(url: str) -> bool:
-    """Check if the URL is plausibly valid."""
     url = url.strip()
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
@@ -247,29 +245,37 @@ def validate_url(url: str) -> bool:
 
 
 def normalize_url(url: str) -> str:
-    """Normalize URL: strip spaces, ensure scheme."""
     url = url.strip()
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     return url
 
 
+def _is_youtube_url(url: str) -> bool:
+    return bool(re.search(
+        r"(youtube\.com|youtu\.be|m\.youtube\.com)", url, re.IGNORECASE
+    ))
+
+
 # ============================================================
-#  YT-DLP CONFIGURATION (2026 Anti-Bot Bypass)
+#  YT-DLP CONFIGURATION (2026 + PO Token)
 # ============================================================
 
-# YouTube player clients to try, in order of reliability.
-# Each attempt uses a different client to avoid the bot detection.
+# YouTube player clients to try, in order.
+# Research shows mweb is most reliable with PO tokens
 YOUTUBE_PLAYER_CLIENTS = [
-    # Order: start with clients least likely to trigger bot detection
-    ["web_creator", "web", "mweb"],
-    ["web", "mweb"],
+    ["mweb", "web"],
+    ["web_creator", "web"],
     ["android"],
     ["ios"],
 ]
 
-# User agents matching each client type
 _USER_AGENTS = {
+    "mweb": (
+        "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/137.0.0.0 Mobile Safari/537.36"
+    ),
     "web_creator": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -279,11 +285,6 @@ _USER_AGENTS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/137.0.0.0 Safari/537.36"
-    ),
-    "mweb": (
-        "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/137.0.0.0 Mobile Safari/537.36"
     ),
     "android": (
         "com.google.android.youtube/19.09.37 (Linux; U; Android 14; en_US; "
@@ -295,25 +296,14 @@ _USER_AGENTS = {
 }
 
 
-def _is_youtube_url(url: str) -> bool:
-    """Check if URL is a YouTube URL."""
-    return bool(re.search(
-        r"(youtube\.com|youtu\.be|m\.youtube\.com)", url, re.IGNORECASE
-    ))
-
-
 def build_ydl_opts(
     media_type: str,
     quality: str,
     output_dir: str = DOWNLOAD_DIR,
     client_index: int = 0,
 ) -> Dict[str, Any]:
-    """Build yt-dlp options optimized for 2026 anti-bot bypass.
+    """Build yt-dlp options with PO Token support."""
 
-    Args:
-        client_index: Which player client set to use (for retry logic).
-    """
-    # Pick player clients for this attempt
     clients = YOUTUBE_PLAYER_CLIENTS[
         min(client_index, len(YOUTUBE_PLAYER_CLIENTS) - 1)
     ]
@@ -330,27 +320,30 @@ def build_ydl_opts(
         "socket_timeout": 30,
         "retries": 5,
         "fragment_retries": 5,
-        # 2026 YouTube anti-bot: try multiple player clients
         "extractor_args": {
             "youtube": {
                 "player_client": clients,
             }
         },
         "user_agent": ua,
-        # Bypass some bot detection checks
         "http_headers": {
             "Accept-Language": "en-US,en;q=0.9",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Ch-Ua-Platform": '"Windows"',
         },
     }
 
-    # --- Proxy for yt-dlp ---
+    # --- Proxy for yt-dlp (NOT for PO token server) ---
     yt_proxy = os.getenv("YTDLP_PROXY", "")
     if yt_proxy:
         opts["proxy"] = yt_proxy
+
+    # --- PO Token Server ---
+    if PO_TOKEN_SERVER_URL:
+        # Tell bgutil HTTP provider where the server is
+        opts["extractor_args"]["youtubepot-bgutilhttp"] = {
+            "base_url": PO_TOKEN_SERVER_URL,
+        }
+        logger.info(f"PO Token server: {PO_TOKEN_SERVER_URL}")
 
     # --- Cookies ---
     if os.path.exists(COOKIE_FILE):
@@ -373,12 +366,11 @@ def build_ydl_opts(
         else:
             opts["format"] = "bestaudio[ext=m4a]/bestaudio"
     else:
-        # Video: use 'best' — never fails with "format not available"
-        # yt-dlp picks the best available format automatically
+        # Video: simple format that always works
         opts["format"] = "best"
         opts["merge_output_format"] = "mp4"
 
-    opts["progress_hooks"] = []  # injected per-download
+    opts["progress_hooks"] = []
     return opts
 
 
@@ -387,7 +379,6 @@ def build_ydl_opts(
 # ============================================================
 
 def make_progress_hook(chat_id: int, status_message_id: int):
-    """Create a progress hook that updates the Telegram status message."""
     last_update_time = [0.0]
 
     def progress_hook(d: dict) -> None:
@@ -432,14 +423,12 @@ def make_progress_hook(chat_id: int, status_message_id: int):
 
 
 def _make_bar(percent: int, length: int = 14) -> str:
-    """Create a unicode progress bar."""
     filled = int(length * percent / 100)
     empty = length - filled
     return "\u2595" + "\u25B0" * filled + "\u25B1" * empty + "\u258f"
 
 
 def _safe_edit(chat_id: int, message_id: int, text: str) -> None:
-    """Edit message safely; ignore if message unchanged or deleted."""
     try:
         bot.edit_message_text(
             text, chat_id=chat_id, message_id=message_id, parse_mode="HTML",
@@ -455,7 +444,6 @@ def _safe_edit(chat_id: int, message_id: int, text: str) -> None:
 def send_file_safely(
     chat_id: int, file_path: str, media_type: str, title: str = "Unknown",
 ) -> bool:
-    """Send file to user with size validation. Returns True on success."""
     file_size = os.path.getsize(file_path)
 
     if file_size > MAX_FILE_SIZE_BYTES:
@@ -493,17 +481,13 @@ def send_file_safely(
 
 
 # ============================================================
-#  YOUTUBE DOWNLOAD WITH RETRY (Anti-Bot Bypass)
+#  YOUTUBE DOWNLOAD WITH RETRY
 # ============================================================
 
 def _try_download_youtube(
     url: str, ydl_opts_base: Dict[str, Any], progress_hook, media_type: str
 ) -> tuple:
-    """Try downloading YouTube URL with multiple player client fallbacks.
-
-    Returns: (info_dict, file_path, video_title)
-    Raises: last exception if all attempts fail.
-    """
+    """Try downloading YouTube URL with multiple player client fallbacks."""
     last_error = None
 
     for attempt, clients in enumerate(YOUTUBE_PLAYER_CLIENTS):
@@ -513,12 +497,9 @@ def _try_download_youtube(
             f"player_client={clients}"
         )
 
-        # Build fresh opts for each attempt (don't mutate the base)
         opts = dict(ydl_opts_base)
         opts["extractor_args"] = {"youtube": {"player_client": clients}}
-        opts["user_agent"] = _USER_AGENTS.get(
-            client_name, _USER_AGENTS["web"]
-        )
+        opts["user_agent"] = _USER_AGENTS.get(client_name, _USER_AGENTS["web"])
         opts["progress_hooks"] = [progress_hook]
 
         try:
@@ -528,7 +509,6 @@ def _try_download_youtube(
                 if info is None:
                     raise ValueError("yt-dlp returned no info")
 
-                # Determine file path
                 file_path = _determine_file_path(ydl, info, media_type)
                 video_title = (
                     info.get("title")
@@ -548,35 +528,33 @@ def _try_download_youtube(
             last_error = e
             error_str = str(e)
 
-            # If it's a bot detection error, try next client
+            # If it's a bot detection or format error, try next client
             if any(
                 keyword in error_str.lower()
                 for keyword in [
                     "sign in to confirm",
                     "not a bot",
                     "returned no info",
-                    "po token",
+                    "requested format is not available",
                     "video unavailable",
                     "sign in",
+                    "login_required",
                 ]
             ):
                 logger.warning(
-                    f"YouTube bot detection on client {client_name}, "
+                    f"YouTube issue on client {client_name}, "
                     f"trying next... ({error_str[:200]})"
                 )
                 continue
             else:
-                # Non-bot-detection error, don't retry with different clients
                 raise
 
-    # All attempts failed
     raise last_error
 
 
 def _determine_file_path(
     ydl: yt_dlp.YoutubeDL, info: dict, media_type: str
 ) -> Optional[str]:
-    """Determine the downloaded file path from yt-dlp info dict."""
     file_path = None
 
     if "requested_downloads" in info and info["requested_downloads"]:
@@ -586,7 +564,6 @@ def _determine_file_path(
     else:
         file_path = ydl.prepare_filename(info)
 
-    # Fix extension for audio post-processing
     if media_type == "audio" and file_path:
         base = os.path.splitext(file_path)[0]
         for ext in (".mp3", ".m4a", ".opus", ".aac", ".webm"):
@@ -603,7 +580,6 @@ def _determine_file_path(
 # ============================================================
 
 def download_and_send(chat_id: int, status_msg_id: int) -> None:
-    """Orchestrate: download -> validate -> send -> cleanup."""
     with _states_lock:
         state = user_states.get(chat_id, {}).copy()
 
@@ -623,12 +599,10 @@ def download_and_send(chat_id: int, status_msg_id: int) -> None:
 
     try:
         if _is_youtube_url(url):
-            # Use retry logic with multiple player clients
             _, file_path, video_title = _try_download_youtube(
                 url, ydl_opts_base, progress_hook, media_type
             )
         else:
-            # Non-YouTube: standard download (no retry needed)
             ydl_opts_base["progress_hooks"] = [progress_hook]
             with yt_dlp.YoutubeDL(ydl_opts_base) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -697,19 +671,15 @@ def download_and_send(chat_id: int, status_msg_id: int) -> None:
             f"<b>Unexpected error:</b>\n<code>{str(e)[:500]}</code>",
         )
     finally:
-        # Cleanup downloaded file
         if file_path and os.path.exists(file_path):
             try:
                 os.remove(file_path)
             except OSError as e:
                 logger.warning(f"Could not delete {file_path}: {e}")
-
-        # Clean orphaned files
         _cleanup_download_dir()
 
 
 def _cleanup_download_dir() -> None:
-    """Remove orphaned files older than 1 hour."""
     try:
         now = time.time()
         for fname in os.listdir(DOWNLOAD_DIR):
@@ -730,7 +700,6 @@ def _cleanup_download_dir() -> None:
 
 @bot.message_handler(commands=["start", "help"])
 def handle_start(message: telebot.types.Message) -> None:
-    """Welcome message with usage instructions."""
     chat_id = message.chat.id
 
     markup = InlineKeyboardMarkup(row_width=1)
@@ -742,6 +711,7 @@ def handle_start(message: telebot.types.Message) -> None:
 
     cookies_status = "Enabled" if os.path.exists(COOKIE_FILE) else "Not configured"
     ffmpeg_status = "Ready" if FFMPEG_AVAILABLE else "MISSING"
+    pot_status = "Configured" if PO_TOKEN_SERVER_URL else "Not configured"
 
     bot.send_message(
         chat_id,
@@ -752,6 +722,7 @@ def handle_start(message: telebot.types.Message) -> None:
             f"<b>Just send me a link to get started!</b>\n\n"
             f"Max file size: <code>{MAX_FILE_SIZE_MB} MB</code>\n"
             f"Cookies: <code>{cookies_status}</code>\n"
+            f"PO Token: <code>{pot_status}</code>\n"
             f"FFmpeg: <code>{ffmpeg_status}</code>"
         ),
         reply_markup=markup,
@@ -760,7 +731,6 @@ def handle_start(message: telebot.types.Message) -> None:
 
 @bot.message_handler(commands=["status"])
 def handle_status(message: telebot.types.Message) -> None:
-    """Show bot health status."""
     chat_id = message.chat.id
     with _states_lock:
         active_sessions = len(user_states)
@@ -775,6 +745,7 @@ def handle_status(message: telebot.types.Message) -> None:
         else "Not set"
     )
     ffmpeg_status = "Present" if FFMPEG_AVAILABLE else "MISSING"
+    pot_status = PO_TOKEN_SERVER_URL if PO_TOKEN_SERVER_URL else "Not configured"
 
     status_text = (
         f"<b>Bot Status</b>\n\n"
@@ -782,6 +753,7 @@ def handle_status(message: telebot.types.Message) -> None:
         f"Active sessions: <code>{active_sessions}</code>\n"
         f"FFmpeg: <code>{ffmpeg_status}</code>\n"
         f"Cookies: <code>{cookies_status}</code>\n"
+        f"PO Token Server: <code>{pot_status}</code>\n"
         f"Proxy: <code>{proxy_status}</code>\n"
         f"Download dir: <code>{DOWNLOAD_DIR}</code>\n"
     )
@@ -790,7 +762,6 @@ def handle_status(message: telebot.types.Message) -> None:
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("info_"))
 def handle_info_callbacks(call: telebot.types.CallbackQuery) -> None:
-    """Handle info button callbacks."""
     chat_id = call.message.chat.id
     data = call.data
 
@@ -825,7 +796,7 @@ def handle_info_callbacks(call: telebot.types.CallbackQuery) -> None:
             "For private Instagram, age-restricted YouTube, etc.\n\n"
             "<b>Method 1 - Browser Extension:</b>\n"
             "Install 'Get cookies.txt LOCALLY' (Chrome/Firefox)\n"
-            "- Visit the site & log in\n"
+            "- Visit the site &amp; log in\n"
             "- Export cookies.txt\n"
             "- Place it at: ./cookies.txt\n\n"
             "<b>Method 2 - Environment Variable (Railway):</b>\n"
@@ -854,7 +825,6 @@ def handle_info_callbacks(call: telebot.types.CallbackQuery) -> None:
 
 @bot.callback_query_handler(func=lambda call: call.data == "info_back")
 def handle_back(call: telebot.types.CallbackQuery) -> None:
-    """Return to the main info menu."""
     chat_id = call.message.chat.id
     markup = InlineKeyboardMarkup(row_width=1)
     markup.add(
@@ -877,11 +847,9 @@ def handle_back(call: telebot.types.CallbackQuery) -> None:
 
 @bot.message_handler(func=lambda message: True)
 def handle_link(message: telebot.types.Message) -> None:
-    """Main handler - receive URL from user and show format picker."""
     chat_id = message.chat.id
     url = message.text.strip() if message.text else ""
 
-    # Rate limit check
     if not check_rate_limit(chat_id):
         bot.reply_to(
             message,
@@ -890,10 +858,8 @@ def handle_link(message: telebot.types.Message) -> None:
         )
         return
 
-    # Cleanup stale states
     cleanup_stale_states()
 
-    # Validate URL
     if not validate_url(url):
         bot.reply_to(
             message,
@@ -909,7 +875,6 @@ def handle_link(message: telebot.types.Message) -> None:
 
     url = normalize_url(url)
 
-    # Store state
     with _states_lock:
         user_states[chat_id] = {
             "url": url,
@@ -917,7 +882,6 @@ def handle_link(message: telebot.types.Message) -> None:
             "download_path": None,
         }
 
-    # Build quality selector
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(
         InlineKeyboardButton("Video", callback_data="type_video"),
@@ -936,13 +900,8 @@ def handle_link(message: telebot.types.Message) -> None:
     )
 
 
-# ============================================================
-#  CALLBACK HANDLERS - TYPE & QUALITY SELECTION
-# ============================================================
-
 @bot.callback_query_handler(func=lambda call: call.data.startswith("type_"))
 def handle_type_selection(call: telebot.types.CallbackQuery) -> None:
-    """User selected Video or Audio - show quality options."""
     chat_id = call.message.chat.id
     data = call.data
 
@@ -1004,7 +963,6 @@ def handle_type_selection(call: telebot.types.CallbackQuery) -> None:
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("q_"))
 def handle_quality_selection(call: telebot.types.CallbackQuery) -> None:
-    """User selected quality - start download."""
     chat_id = call.message.chat.id
     quality = call.data.split("_", 1)[1]
 
@@ -1032,7 +990,6 @@ def handle_quality_selection(call: telebot.types.CallbackQuery) -> None:
 
     bot.answer_callback_query(call.id)
 
-    # Fire download in a background thread
     thread = threading.Thread(
         target=download_and_send,
         args=(chat_id, call.message.message_id),
@@ -1046,7 +1003,6 @@ def handle_quality_selection(call: telebot.types.CallbackQuery) -> None:
 # ============================================================
 
 def safe_polling() -> None:
-    """Run bot polling with automatic restart on errors."""
     logger.info("Bot is starting...")
     while True:
         try:
@@ -1081,6 +1037,7 @@ if __name__ == "__main__":
     logger.info(
         f"Proxy: {'Connected' if (PROXY_ENABLED and not _proxy_needs_fallback) else 'Fallback/direct' if _proxy_needs_fallback else 'Not configured'}"
     )
+    logger.info(f"PO Token Server: {PO_TOKEN_SERVER_URL or 'Not configured'}")
     logger.info(f"FFmpeg: {'Available' if FFMPEG_AVAILABLE else 'MISSING'}")
     logger.info(f"Max file size: {MAX_FILE_SIZE_MB} MB")
     logger.info(

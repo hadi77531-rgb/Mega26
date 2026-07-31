@@ -1,42 +1,52 @@
-# ============================================================
-#  Dockerfile for Media Downloader Bot
-# ============================================================
-#
-#  Build:
-#    docker build -t media-downloader-bot .
-#
-#  Run:
-#    docker run -d \
-#      --name media-downloader-bot \
-#      --env-file .env \
-#      -v $(pwd)/downloads:/app/downloads \
-#      -v $(pwd)/cookies.txt:/app/cookies.txt:ro \
-#      -v $(pwd)/bot.log:/app/bot.log \
-#      media-downloader-bot
-#
-#  Logs:
-#    docker logs -f media-downloader-bot
-# ============================================================
+FROM python:3.11-slim
 
-FROM python:3.12-slim-bookworm
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    curl \
+    unzip \
+    git \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install ffmpeg
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg && \
-    rm -rf /var/lib/apt/lists/*
+# Install Deno v2.9+ (required by yt-dlp 2026)
+# yt-dlp 2026 requires Deno >= 2.3.0 for YouTube extraction
+ENV DENO_INSTALL=/root/.deno
+ENV PATH="$DENO_INSTALL/bin:$PATH"
+RUN curl -fsSL https://deno.land/install.sh | sh -s v2.9.2
+RUN deno --version
 
-# Create app directory
+# Install yt-dlp with [default] extra (installs yt-dlp-ejs JS runtime)
+RUN pip install --no-cache-dir "yt-dlp[default]>=2026.7.4"
+
+# Install PO Token provider
+RUN pip install --no-cache-dir bgutil-ytdlp-pot-provider
+
+# Clone bgutil PO Token server
+RUN git clone --single-branch --branch 1.3.1 \
+    https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git \
+    /opt/bgutil-ytdlp-pot-provider
+
+# Install deno dependencies for the PO Token server
+WORKDIR /opt/bgutil-ytdlp-pot-provider/server
+RUN deno install --allow-scripts=npm:canvas --frozen 2>/dev/null || true
+
+# Verify installations
+RUN echo "=== Verification ===" && \
+    python --version && \
+    yt-dlp --version && \
+    deno --version && \
+    ffmpeg -version 2>&1 | head -1
+
+# Install Python dependencies for the bot
 WORKDIR /app
-
-# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Copy bot code
 COPY bot.py .
+COPY start.sh .
+RUN chmod +x start.sh
 
-# Create downloads directory
-RUN mkdir -p /app/downloads
+EXPOSE 8080
 
-# Run the bot
-CMD ["python", "bot.py"]
+CMD ["./start.sh"]
