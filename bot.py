@@ -14,6 +14,7 @@ import sys
 import time
 import shutil
 import logging
+import tempfile
 import threading
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -48,6 +49,8 @@ PROXY_HTTPS: str = os.getenv("PROXY_HTTPS", "")
 PROXY_ENABLED = bool(PROXY_HTTP or PROXY_HTTPS)
 _proxy_needs_fallback = False
 
+logger = None  # Will be initialized in LOGGING section
+
 if PROXY_ENABLED:
     proxy_dict: Dict[str, str] = {}
     if PROXY_HTTP:
@@ -71,7 +74,6 @@ if PROXY_ENABLED:
 
         if _result == 0:
             apihelper.proxy = proxy_dict
-            logger.info(f"Proxy connected: {_host}:{_port} (HTTP={bool(PROXY_HTTP)}, HTTPS={bool(PROXY_HTTPS)})")
             print(f"Proxy connected: {_host}:{_port}")
         else:
             print(f"WARNING: Proxy {_host}:{_port} is not reachable.")
@@ -90,6 +92,23 @@ else:
 COOKIE_FILE: str = os.path.expanduser(
     os.getenv("COOKIE_FILE", "cookies.txt")
 )
+
+# --- YouTube Cookies from environment variable (for Railway/cloud) ---
+# Set YOUTUBE_COOKIES env var with the full Netscape cookie text
+YOUTUBE_COOKIES_TEXT: str = os.getenv("YOUTUBE_COOKIES", "")
+_cookie_temp_file: Optional[str] = None
+
+if YOUTUBE_COOKIES_TEXT:
+    try:
+        _cookie_temp_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, prefix="yt_cookies_"
+        ).name
+        with open(_cookie_temp_file, "w", encoding="utf-8") as f:
+            f.write(YOUTUBE_COOKIES_TEXT)
+        COOKIE_FILE = _cookie_temp_file
+        print(f"YouTube cookies loaded from YOUTUBE_COOKIES env var -> {_cookie_temp_file}")
+    except Exception as _e:
+        print(f"WARNING: Failed to write cookie temp file: {_e}")
 
 # --- Limits ---
 MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
@@ -236,13 +255,70 @@ def normalize_url(url: str) -> str:
 
 
 # ============================================================
-#  YT-DLP CONFIGURATION (2026 Optimized)
+#  YT-DLP CONFIGURATION (2026 Anti-Bot Bypass)
 # ============================================================
 
+# YouTube player clients to try, in order of reliability.
+# Each attempt uses a different client to avoid the bot detection.
+YOUTUBE_PLAYER_CLIENTS = [
+    # Order: start with clients least likely to trigger bot detection
+    ["web_creator", "web", "mweb"],
+    ["web", "mweb"],
+    ["android"],
+    ["ios"],
+]
+
+# User agents matching each client type
+_USER_AGENTS = {
+    "web_creator": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/137.0.0.0 Safari/537.36"
+    ),
+    "web": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/137.0.0.0 Safari/537.36"
+    ),
+    "mweb": (
+        "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/137.0.0.0 Mobile Safari/537.36"
+    ),
+    "android": (
+        "com.google.android.youtube/19.09.37 (Linux; U; Android 14; en_US; "
+        "Pixel 8 Pro; Build/UP1A.231105.001) gzip"
+    ),
+    "ios": (
+        "com.google.ios.youtube/19.09.3 (iPhone14,3; U; CPU iOS 17_4 like Mac OS X; en_US)"
+    ),
+}
+
+
+def _is_youtube_url(url: str) -> bool:
+    """Check if URL is a YouTube URL."""
+    return bool(re.search(
+        r"(youtube\.com|youtu\.be|m\.youtube\.com)", url, re.IGNORECASE
+    ))
+
+
 def build_ydl_opts(
-    media_type: str, quality: str, output_dir: str = DOWNLOAD_DIR
+    media_type: str,
+    quality: str,
+    output_dir: str = DOWNLOAD_DIR,
+    client_index: int = 0,
 ) -> Dict[str, Any]:
-    """Build yt-dlp options optimized for 2026 compatibility."""
+    """Build yt-dlp options optimized for 2026 anti-bot bypass.
+
+    Args:
+        client_index: Which player client set to use (for retry logic).
+    """
+    # Pick player clients for this attempt
+    clients = YOUTUBE_PLAYER_CLIENTS[
+        min(client_index, len(YOUTUBE_PLAYER_CLIENTS) - 1)
+    ]
+    primary_client = clients[0]
+    ua = _USER_AGENTS.get(primary_client, _USER_AGENTS["web"])
 
     opts: Dict[str, Any] = {
         "outtmpl": os.path.join(output_dir, "%(title).100s_%(id)s.%(ext)s"),
@@ -254,17 +330,21 @@ def build_ydl_opts(
         "socket_timeout": 30,
         "retries": 5,
         "fragment_retries": 5,
-        # 2026 YouTube SABR bypass
+        # 2026 YouTube anti-bot: try multiple player clients
         "extractor_args": {
             "youtube": {
-                "player_client": ["default", "-android_sdkless"],
+                "player_client": clients,
             }
         },
-        "user_agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/126.0.0.0 Safari/537.36"
-        ),
+        "user_agent": ua,
+        # Bypass some bot detection checks
+        "http_headers": {
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+        },
     }
 
     # --- Proxy for yt-dlp ---
@@ -416,6 +496,112 @@ def send_file_safely(
 
 
 # ============================================================
+#  YOUTUBE DOWNLOAD WITH RETRY (Anti-Bot Bypass)
+# ============================================================
+
+def _try_download_youtube(
+    url: str, ydl_opts_base: Dict[str, Any], progress_hook, media_type: str
+) -> tuple:
+    """Try downloading YouTube URL with multiple player client fallbacks.
+
+    Returns: (info_dict, file_path, video_title)
+    Raises: last exception if all attempts fail.
+    """
+    last_error = None
+
+    for attempt, clients in enumerate(YOUTUBE_PLAYER_CLIENTS):
+        client_name = clients[0]
+        logger.info(
+            f"YouTube attempt {attempt + 1}/{len(YOUTUBE_PLAYER_CLIENTS)}: "
+            f"player_client={clients}"
+        )
+
+        # Build fresh opts for each attempt (don't mutate the base)
+        opts = dict(ydl_opts_base)
+        opts["extractor_args"] = {"youtube": {"player_client": clients}}
+        opts["user_agent"] = _USER_AGENTS.get(
+            client_name, _USER_AGENTS["web"]
+        )
+        opts["progress_hooks"] = [progress_hook]
+
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+
+                if info is None:
+                    raise ValueError("yt-dlp returned no info")
+
+                # Determine file path
+                file_path = _determine_file_path(ydl, info, media_type)
+                video_title = (
+                    info.get("title")
+                    or info.get("fulltitle")
+                    or info.get("alt_title")
+                    or "Unknown"
+                )
+
+                if file_path and os.path.exists(file_path):
+                    return info, file_path, video_title
+                else:
+                    raise FileNotFoundError(
+                        f"Downloaded file not found: {file_path}"
+                    )
+
+        except Exception as e:
+            last_error = e
+            error_str = str(e)
+
+            # If it's a bot detection error, try next client
+            if any(
+                keyword in error_str.lower()
+                for keyword in [
+                    "sign in to confirm",
+                    "not a bot",
+                    "returned no info",
+                    "po token",
+                    "video unavailable",
+                    "sign in",
+                ]
+            ):
+                logger.warning(
+                    f"YouTube bot detection on client {client_name}, "
+                    f"trying next... ({error_str[:200]})"
+                )
+                continue
+            else:
+                # Non-bot-detection error, don't retry with different clients
+                raise
+
+    # All attempts failed
+    raise last_error
+
+
+def _determine_file_path(
+    ydl: yt_dlp.YoutubeDL, info: dict, media_type: str
+) -> Optional[str]:
+    """Determine the downloaded file path from yt-dlp info dict."""
+    file_path = None
+
+    if "requested_downloads" in info and info["requested_downloads"]:
+        file_path = info["requested_downloads"][0].get("filepath", "")
+    elif "requested_formats" in info and info["requested_formats"]:
+        file_path = ydl.prepare_filename(info)
+    else:
+        file_path = ydl.prepare_filename(info)
+
+    # Fix extension for audio post-processing
+    if media_type == "audio" and file_path:
+        base = os.path.splitext(file_path)[0]
+        for ext in (".mp3", ".m4a", ".opus", ".aac", ".webm"):
+            candidate = base + ext
+            if os.path.exists(candidate):
+                file_path = candidate
+                break
+
+    return file_path
+
+
+# ============================================================
 #  MAIN DOWNLOAD LOGIC
 # ============================================================
 
@@ -432,45 +618,39 @@ def download_and_send(chat_id: int, status_msg_id: int) -> None:
         _safe_edit(chat_id, status_msg_id, "Session expired. Send a new link.")
         return
 
-    ydl_opts = build_ydl_opts(media_type, quality)
-    ydl_opts["progress_hooks"] = [make_progress_hook(chat_id, status_msg_id)]
+    ydl_opts_base = build_ydl_opts(media_type, quality)
+    progress_hook = make_progress_hook(chat_id, status_msg_id)
 
     file_path: Optional[str] = None
     video_title: str = "Unknown"
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-
-            if info is None:
-                raise ValueError("yt-dlp returned no info")
-
-            # Determine downloaded file path
-            if "requested_downloads" in info and info["requested_downloads"]:
-                file_path = info["requested_downloads"][0].get("filepath", "")
-            elif "requested_formats" in info and info["requested_formats"]:
-                file_path = ydl.prepare_filename(info)
-            else:
-                file_path = ydl.prepare_filename(info)
-
-            # Fix extension for audio post-processing
-            if media_type == "audio" and file_path:
-                base = os.path.splitext(file_path)[0]
-                for ext in (".mp3", ".m4a", ".opus", ".aac", ".webm"):
-                    candidate = base + ext
-                    if os.path.exists(candidate):
-                        file_path = candidate
-                        break
-
-            video_title = (
-                info.get("title")
-                or info.get("fulltitle")
-                or info.get("alt_title")
-                or "Unknown"
+        if _is_youtube_url(url):
+            # Use retry logic with multiple player clients
+            _, file_path, video_title = _try_download_youtube(
+                url, ydl_opts_base, progress_hook, media_type
             )
+        else:
+            # Non-YouTube: standard download (no retry needed)
+            ydl_opts_base["progress_hooks"] = [progress_hook]
+            with yt_dlp.YoutubeDL(ydl_opts_base) as ydl:
+                info = ydl.extract_info(url, download=True)
 
-        if not file_path or not os.path.exists(file_path):
-            raise FileNotFoundError(f"Downloaded file not found: {file_path}")
+                if info is None:
+                    raise ValueError("yt-dlp returned no info")
+
+                file_path = _determine_file_path(ydl, info, media_type)
+                video_title = (
+                    info.get("title")
+                    or info.get("fulltitle")
+                    or info.get("alt_title")
+                    or "Unknown"
+                )
+
+                if not file_path or not os.path.exists(file_path):
+                    raise FileNotFoundError(
+                        f"Downloaded file not found: {file_path}"
+                    )
 
         file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
 
@@ -503,7 +683,8 @@ def download_and_send(chat_id: int, status_msg_id: int) -> None:
             (
                 f"<b>Download failed.</b>\n\n"
                 f"<code>{error_msg}</code>\n\n"
-                f"<i>Try a different quality or use cookies for private content.</i>"
+                f"<i>Try a different quality, or add YouTube cookies "
+                f"via YOUTUBE_COOKIES env var for better results.</i>"
             ),
         )
     except FileNotFoundError as e:
@@ -650,11 +831,11 @@ def handle_info_callbacks(call: telebot.types.CallbackQuery) -> None:
             "- Visit the site & log in\n"
             "- Export cookies.txt\n"
             "- Place it at: ./cookies.txt\n\n"
-            "<b>Method 2 - yt-dlp command:</b>\n"
-            "yt-dlp --cookies-from-browser chrome URL\n\n"
-            "<b>Method 3 - Manual:</b>\n"
-            "Create cookies.txt in Netscape format\n"
-            "- Set COOKIE_FILE in .env"
+            "<b>Method 2 - Environment Variable (Railway):</b>\n"
+            "Set YOUTUBE_COOKIES in Railway env vars\n"
+            "with the full cookies.txt content\n\n"
+            "<b>Method 3 - yt-dlp command:</b>\n"
+            "yt-dlp --cookies-from-browser chrome URL"
         )
     else:
         text = "Unknown info."
