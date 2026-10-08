@@ -1,35 +1,120 @@
 #!/usr/bin/env python3
 """
 ============================================================
-  Universal Media Downloader - Telegram Bot (2026 Edition)
+  Universal Media Downloader - Telegram Bot
 ============================================================
-Supports: YouTube, Instagram, TikTok, Twitter/X, and 1000+ sites
-Powered by: yt-dlp + pyTelegramBotAPI + bgutil PO Token
+Supports : YouTube, Instagram (video + PHOTO + CAROUSEL),
+           TikTok, Twitter/X, Facebook and 1000+ sites
+Engine   : yt-dlp + pyTelegramBotAPI + bgutil PO Token
+Deploy   : Railway (Docker) or local
 ============================================================
 """
 
 import os
 import re
 import sys
+import html
+import json
 import time
 import shutil
 import logging
+import subprocess
 import tempfile
 import threading
-import subprocess
-from pathlib import Path
+import urllib.request
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 
 import telebot
 from telebot import apihelper
 from telebot.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    InputMediaPhoto,
+    InputMediaVideo,
 )
 from dotenv import load_dotenv
 
 import yt_dlp
+
+# ============================================================
+#  INSTAGRAM PHOTO SUPPORT
+#  yt-dlp's Instagram extractor only handles VIDEO.  A photo
+#  post raises "There is no video in this post" and every item
+#  of a carousel raises "No video formats found!".  We expose
+#  image_versions2.candidates[] as a normal yt-dlp format so
+#  photos and carousels download exactly like videos do.
+# ============================================================
+
+IG_PATCH_OK = False
+try:
+    from yt_dlp.extractor.instagram import InstagramIE
+
+    _ig_orig_extract_product_media = InstagramIE._extract_product_media
+
+    def _ig_candidate_score(url: str) -> int:
+        """Instagram CDN candidate URL -> rough pixel area.
+        The plain, uncropped URL is the original file and always wins."""
+        if not url:
+            return -1
+        if re.search(r"_[sc]\d+x\d+_", url) is None and re.search(r"c\d+\.\d+", url) is None:
+            return 10 ** 12
+        m = re.search(r"_s(\d+)x(\d+)_", url)
+        if m:
+            return int(m.group(1)) * int(m.group(2))
+        m = re.search(r"c\d+\.\d+\.\d+\.\d+a.*?_s(\d+)", url)
+        if m:
+            return int(m.group(1)) ** 2 // 2
+        return 0
+
+    def _ig_extract_product_media(self, product_media):
+        info = _ig_orig_extract_product_media(self, product_media)
+        if info.get("formats"):
+            info["is_image"] = False
+            return info
+
+        candidates = [
+            c
+            for c in ((product_media or {}).get("image_versions2") or {}).get("candidates") or []
+            if c.get("url")
+        ]
+        if not candidates:
+            return info
+
+        url = max(candidates, key=lambda c: _ig_candidate_score(c.get("url"))).get("url")
+        ext = "png" if ".png" in url else ("webp" if ".webp" in url else "jpg")
+
+        info["is_image"] = True
+        info["ext"] = ext
+        # "_extract_product" labels everything "Video by <user>";
+        # rename it when the entry is actually a photo.
+        old_title = info.get("title") or ""
+        if old_title.startswith("Video by "):
+            info["title"] = "Photo by " + old_title[len("Video by "):]
+        elif not old_title:
+            username = ((product_media or {}).get("user") or {}).get("username")
+            info["title"] = f"Photo by {username}" if username else "Photo"
+        info["formats"] = [
+            {
+                "format_id": "photo",
+                "format_note": "InstagramPhoto",
+                "url": url,
+                "ext": ext,
+                "width": product_media.get("original_width"),
+                "height": product_media.get("original_height"),
+                "filesize": None,
+                "protocol": "https",
+                "http_headers": {"Referer": "https://www.instagram.com/"},
+                "_in_manifest": False,
+            }
+        ]
+        return info
+
+    InstagramIE._extract_product_media = _ig_extract_product_media
+    IG_PATCH_OK = True
+except Exception as _ig_err:  # pragma: no cover
+    print(f"WARNING: Instagram photo patch not applied: {_ig_err}")
+
 
 # ============================================================
 #  ENVIRONMENT & CONFIGURATION
@@ -42,15 +127,13 @@ if not BOT_TOKEN:
     print("ERROR: BOT_TOKEN is not set in .env file!")
     sys.exit(1)
 
-# --- Proxy (essential for Iran / restricted networks) ---
 PROXY_HTTP: str = os.getenv("PROXY_HTTP", "")
 PROXY_HTTPS: str = os.getenv("PROXY_HTTPS", "")
 
-# --- Proxy fallback: try proxy, fall back to direct if unavailable ---
 PROXY_ENABLED = bool(PROXY_HTTP or PROXY_HTTPS)
 _proxy_needs_fallback = False
 
-logger = None  # Will be initialized in LOGGING section
+logger = None  # initialized in the LOGGING section
 
 if PROXY_ENABLED:
     proxy_dict: Dict[str, str] = {}
@@ -89,14 +172,10 @@ else:
     print("No proxy configured. Using direct connection.")
 
 # --- Cookie file for authenticated downloads ---
-COOKIE_FILE: str = os.path.expanduser(
-    os.getenv("COOKIE_FILE", "cookies.txt")
-)
+COOKIE_FILE: str = os.path.expanduser(os.getenv("COOKIE_FILE", "cookies.txt"))
 
-# --- YouTube Cookies from environment variable (for Railway/cloud) ---
+# --- YouTube cookies from env var (Railway / cloud) ---
 YOUTUBE_COOKIES_TEXT: str = os.getenv("YOUTUBE_COOKIES", "")
-_cookie_temp_file: Optional[str] = None
-
 if YOUTUBE_COOKIES_TEXT:
     try:
         _cookie_temp_file = tempfile.NamedTemporaryFile(
@@ -109,20 +188,137 @@ if YOUTUBE_COOKIES_TEXT:
     except Exception as _e:
         print(f"WARNING: Failed to write cookie temp file: {_e}")
 
-# --- PO Token Server URL (bgutil HTTP server) ---
+# --- PO Token server URL (bgutil HTTP server) ---
 PO_TOKEN_SERVER_URL: str = os.getenv("PO_TOKEN_SERVER_URL", "")
+
+# ============================================================
+#  PO TOKEN PROVIDER - HEALTH CHECK
+#  The bgutil provider has two flavours:
+#    * HTTP server  (PO_TOKEN_SERVER_URL)  - used on Railway
+#    * local script (~/bgutil-ytdlp-pot-provider) - used on a PC
+#  If either one is broken, yt-dlp aborts the WHOLE download
+#  instead of continuing without a token.  We therefore check
+#  the provider once and switch it off cleanly when unusable:
+#  pointing the script provider at a file that does not exist
+#  makes its is_available() return False without spawning a
+#  runtime that can hang.
+# ============================================================
+
+# Pointing the script provider at a path that cannot exist disables it.
+_PO_SCRIPT_OFF: str = "/__bgutil_disabled/generate_once.ts"
+
+
+def _bgutil_version() -> str:
+    try:
+        from importlib import metadata as _md
+        return _md.version("bgutil-ytdlp-pot-provider")
+    except Exception:
+        try:
+            from yt_dlp_plugins.extractor.getpot_bgutil import __version__
+            return str(__version__)
+        except Exception:
+            return "unknown"
+
+
+BGUTIL_VERSION: str = _bgutil_version()
+_po_status: Dict[str, str] = {"mode": "", "detail": "not checked yet"}
+
+
+def _check_http_po_server() -> Tuple[bool, str]:
+    if not PO_TOKEN_SERVER_URL:
+        return False, "PO_TOKEN_SERVER_URL is not set"
+    ping = PO_TOKEN_SERVER_URL.rstrip("/") + "/ping"
+    try:
+        with urllib.request.urlopen(ping, timeout=6) as resp:
+            payload = resp.read().decode("utf-8", "replace") or "{}"
+        data = json.loads(payload)
+    except Exception as exc:
+        return False, f"cannot reach {ping}: {exc}"
+    version = str(data.get("version") or "")
+    if not version:
+        return False, "server did not report a version"
+    if version.split(".", 1)[0] != BGUTIL_VERSION.split(".", 1)[0]:
+        return False, (
+            f"version mismatch - plugin {BGUTIL_VERSION} vs server {version}. "
+            f"Rebuild with matching versions."
+        )
+    return True, f"HTTP server {version} (plugin {BGUTIL_VERSION})"
+
+
+def _check_script_po() -> Tuple[bool, str]:
+    home = os.path.expanduser("~/bgutil-ytdlp-pot-provider/server")
+    script = None
+    for rel in (os.path.join("src", "generate_once.ts"), os.path.join("build", "generate_once.js")):
+        candidate = os.path.join(home, rel)
+        if os.path.isfile(candidate):
+            script = candidate
+            break
+    if not script:
+        return False, f"no script at {home}"
+
+    runtime = shutil.which("deno") or shutil.which("node")
+    if not runtime:
+        return False, "no deno/node runtime on PATH"
+    cmd = [runtime]
+    if os.path.basename(runtime).lower().startswith("deno"):
+        cmd += ["run", "--allow-env", "--allow-net", "--allow-read",
+                "--allow-write", "--allow-ffi"]
+    cmd += [script, "--version"]
+    try:
+        proc = subprocess.run(
+            cmd, timeout=10, capture_output=True, text=True,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "script did not answer within 10s"
+    except Exception as exc:
+        return False, f"script failed to start: {exc}"
+    if proc.returncode:
+        tail = (proc.stderr or proc.stdout or "").strip()[-200:]
+        return False, f"script exit {proc.returncode}: {tail}"
+    return True, f"local script ({os.path.basename(script)})"
+
+
+def check_po_provider(force: bool = False) -> str:
+    """Decide once whether the PO token provider is usable."""
+    if _po_status["mode"] and not force:
+        return _po_status["mode"]
+    if PO_TOKEN_SERVER_URL:
+        ok, detail = _check_http_po_server()
+        mode = "http" if ok else "off"
+    else:
+        ok, detail = _check_script_po()
+        mode = "script" if ok else "off"
+    _po_status["mode"] = mode
+    _po_status["detail"] = detail
+    level = logging.INFO if ok else logging.WARNING
+    logger.log(level, f"PO token provider = {mode}: {detail}")
+    return mode
+
+
+def _apply_po_args(extractor_args: Dict[str, Any]) -> None:
+    """Fill extractor_args for the PO provider currently in use."""
+    mode = check_po_provider()
+    if mode == "http":
+        extractor_args["youtubepot-bgutilhttp"] = {"base_url": PO_TOKEN_SERVER_URL}
+        extractor_args["youtubepot-bgutilscript"] = {"script_path": _PO_SCRIPT_OFF}
+    elif mode == "script":
+        extractor_args["youtubepot-bgutilscript"] = {"server_home": os.path.expanduser(
+            "~/bgutil-ytdlp-pot-provider/server")}
+    else:
+        # provider off - never let it spawn a runtime
+        extractor_args["youtubepot-bgutilscript"] = {"script_path": _PO_SCRIPT_OFF}
 
 # --- Limits ---
 MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 MAX_FILE_SIZE_BYTES: int = MAX_FILE_SIZE_MB * 1024 * 1024
 RATE_LIMIT_WINDOW: int = int(os.getenv("RATE_LIMIT_WINDOW", "30"))
 MAX_REQUESTS_PER_WINDOW: int = int(os.getenv("MAX_REQUESTS_PER_WINDOW", "5"))
+MAX_PHOTOS_PER_POST: int = int(os.getenv("MAX_PHOTOS_PER_POST", "30"))
+UPLOAD_TIMEOUT: int = int(os.getenv("UPLOAD_TIMEOUT", "600"))
 
 # --- Paths ---
-DOWNLOAD_DIR: str = os.path.expanduser(
-    os.getenv("DOWNLOAD_DIR", "~/downloads")
-)
-
+DOWNLOAD_DIR: str = os.path.expanduser(os.getenv("DOWNLOAD_DIR", "~/downloads"))
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # ============================================================
@@ -153,6 +349,8 @@ if not FFMPEG_AVAILABLE:
 else:
     logger.info(f"ffmpeg found at: {shutil.which('ffmpeg')}")
 
+logger.info(f"Instagram photo patch: {'APPLIED' if IG_PATCH_OK else 'FAILED'}")
+
 # ============================================================
 #  BOT INITIALIZATION
 # ============================================================
@@ -165,7 +363,7 @@ except Exception:
     pass
 
 # ============================================================
-#  DATA STRUCTURES (Thread-Safe)
+#  DATA STRUCTURES (thread-safe)
 # ============================================================
 
 user_states: Dict[int, Dict[str, Any]] = {}
@@ -173,6 +371,10 @@ _states_lock = threading.Lock()
 
 rate_limit_map: Dict[int, list] = {}
 _rate_lock = threading.Lock()
+
+# ============================================================
+#  STATE / RATE LIMIT HELPERS
+# ============================================================
 
 
 def cleanup_stale_states(max_age_seconds: int = 1800) -> None:
@@ -184,15 +386,22 @@ def cleanup_stale_states(max_age_seconds: int = 1800) -> None:
             if (now - s.get("timestamp", now)).total_seconds() > max_age_seconds
         ]
         for cid in stale:
-            dp = user_states[cid].get("download_path", "")
-            if dp and os.path.exists(dp):
-                try:
-                    os.remove(dp)
-                except OSError:
-                    pass
             del user_states[cid]
     if stale:
         logger.info(f"Cleaned up {len(stale)} stale user states")
+
+
+def cleanup_rate_map(max_age_seconds: int = 3600) -> None:
+    """Drop idle users from the rate-limit map so it cannot grow forever."""
+    now = datetime.now()
+    with _rate_lock:
+        idle = [
+            cid
+            for cid, stamps in rate_limit_map.items()
+            if not stamps or (now - max(stamps)).total_seconds() > max_age_seconds
+        ]
+        for cid in idle:
+            del rate_limit_map[cid]
 
 
 def check_rate_limit(chat_id: int) -> bool:
@@ -211,7 +420,7 @@ def check_rate_limit(chat_id: int) -> bool:
 
 
 # ============================================================
-#  URL VALIDATION
+#  URL VALIDATION / EXTRACTION
 # ============================================================
 
 SUPPORTED_DOMAINS = re.compile(
@@ -230,18 +439,32 @@ SUPPORTED_DOMAINS = re.compile(
     re.IGNORECASE,
 )
 
-GENERIC_URL = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+# Finds the first http(s) URL inside an arbitrary message.
+# Handles "@url:https://...", backticks, <angle brackets> and trailing punctuation.
+URL_FINDER = re.compile(r"https?://[^\s<>\"'`\)\]\}]+", re.IGNORECASE)
+
+_TRAILING_JUNK = ".,;:!?\")]'`}"
+
+
+def extract_url(text: str) -> str:
+    """Pull the first real URL out of a message; return '' when there is none."""
+    if not text:
+        return ""
+    match = URL_FINDER.search(text)
+    if not match:
+        return ""
+    url = match.group(0).rstrip(_TRAILING_JUNK)
+    return url
 
 
 def validate_url(url: str) -> bool:
-    url = url.strip()
+    if not url:
+        return False
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     if SUPPORTED_DOMAINS.match(url):
         return True
-    if GENERIC_URL.match(url):
-        return True
-    return False
+    return bool(re.match(r"^https?://[^\s/]+\.[^\s/]+", url))
 
 
 def normalize_url(url: str) -> str:
@@ -252,23 +475,56 @@ def normalize_url(url: str) -> str:
 
 
 def _is_youtube_url(url: str) -> bool:
-    return bool(re.search(
-        r"(youtube\.com|youtu\.be|m\.youtube\.com)", url, re.IGNORECASE
-    ))
+    return bool(re.search(r"(youtube\.com|youtu\.be|m\.youtube\.com)", url, re.IGNORECASE))
+
+
+def _is_instagram_url(url: str) -> bool:
+    return bool(re.search(r"(instagram\.com|instagr\.am)", url, re.IGNORECASE))
+
+
+def esc(text: Any) -> str:
+    """Escape text for Telegram HTML parse mode.
+
+    Unescaped '&' or '<' in a video title makes Telegram reject the whole
+    message, which looks like a download failure to the user."""
+    return html.escape(str(text), quote=False)
 
 
 # ============================================================
-#  YT-DLP CONFIGURATION (2026 + PO Token)
+#  YT-DLP CONFIGURATION
 # ============================================================
 
-# YouTube player clients to try, in order.
-# Research shows mweb is most reliable with PO tokens
-YOUTUBE_PLAYER_CLIENTS = [
+# YouTube player-client tiers, tried in order.
+# None means "let yt-dlp choose its own defaults".
+#
+# With a working PO token the web-family clients are the best;
+# without one they trigger the "confirm you're not a bot" wall, so
+# we switch the order around (defaults / android first).
+TIERS_WITH_PO: List[Optional[List[str]]] = [
     ["mweb", "web"],
+    ["tv", "web_safari"],
     ["web_creator", "web"],
+    None,
     ["android"],
     ["ios"],
 ]
+
+TIERS_WITHOUT_PO: List[Optional[List[str]]] = [
+    None,
+    ["android"],
+    ["mweb", "web"],
+    ["ios"],
+    ["tv", "web_safari"],
+]
+
+
+def client_tiers() -> List[Optional[List[str]]]:
+    """Ordered player-client tiers for the current PO provider state."""
+    return TIERS_WITH_PO if check_po_provider() in ("http", "script") else TIERS_WITHOUT_PO
+
+
+def tier_label(clients: Optional[List[str]]) -> str:
+    return "yt-dlp defaults" if clients is None else "+".join(clients)
 
 _USER_AGENTS = {
     "mweb": (
@@ -281,6 +537,12 @@ _USER_AGENTS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/137.0.0.0 Safari/537.36"
     ),
+    "web_safari": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+        "Version/17.4 Safari/605.1.15"
+    ),
+    "tv": "Mozilla/5.0 (QtEmbedded; U; Linux) AppleWebKit/537.36",
     "web": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -290,41 +552,36 @@ _USER_AGENTS = {
         "com.google.android.youtube/19.09.37 (Linux; U; Android 14; en_US; "
         "Pixel 8 Pro; Build/UP1A.231105.001) gzip"
     ),
-    "ios": (
-        "com.google.ios.youtube/19.09.3 (iPhone14,3; U; CPU iOS 17_4 like Mac OS X; en_US)"
-    ),
+    "ios": "com.google.ios.youtube/19.09.3 (iPhone14,3; U; CPU iOS 17_4 like Mac OS X; en_US)",
 }
-
 
 def build_ydl_opts(
     media_type: str,
     quality: str,
+    clients: Optional[List[str]] = None,
     output_dir: str = DOWNLOAD_DIR,
-    client_index: int = 0,
 ) -> Dict[str, Any]:
-    """Build yt-dlp options with PO Token support."""
+    """Build yt-dlp options.
 
-    clients = YOUTUBE_PLAYER_CLIENTS[
-        min(client_index, len(YOUTUBE_PLAYER_CLIENTS) - 1)
-    ]
-    primary_client = clients[0]
-    ua = _USER_AGENTS.get(primary_client, _USER_AGENTS["web"])
+    ``media_type``: video | audio | image
+    ``clients``   : YouTube player-client list, or None for yt-dlp defaults.
+    """
+    ua = _USER_AGENTS.get((clients or ["web"])[0], _USER_AGENTS["web"])
 
     opts: Dict[str, Any] = {
         "outtmpl": os.path.join(output_dir, "%(title).100s_%(id)s.%(ext)s"),
-        "noplaylist": True,
+        # image mode must keep every carousel item
+        "noplaylist": media_type != "image",
         "quiet": True,
         "no_warnings": True,
         "extract_flat": False,
-        "ignoreerrors": True,
+        # ignoreerrors=True swallows the real failure and returns None,
+        # which the old code then reported as "yt-dlp returned no info".
+        "ignoreerrors": False,
         "socket_timeout": 30,
         "retries": 5,
         "fragment_retries": 5,
-        "extractor_args": {
-            "youtube": {
-                "player_client": clients,
-            }
-        },
+        "extractor_args": {},
         "user_agent": ua,
         "http_headers": {
             "Accept-Language": "en-US,en;q=0.9",
@@ -332,25 +589,20 @@ def build_ydl_opts(
         },
     }
 
-    # --- Proxy for yt-dlp (NOT for PO token server) ---
+    # --- Proxy for yt-dlp (NOT for the PO token server) ---
     yt_proxy = os.getenv("YTDLP_PROXY", "")
     if yt_proxy:
         opts["proxy"] = yt_proxy
 
-    # --- PO Token Server ---
-    if PO_TOKEN_SERVER_URL:
-        # Tell bgutil HTTP provider where the server is
-        opts["extractor_args"]["youtubepot-bgutilhttp"] = {
-            "base_url": PO_TOKEN_SERVER_URL,
-        }
-        logger.info(f"PO Token server: {PO_TOKEN_SERVER_URL}")
+    if clients is not None:
+        opts["extractor_args"]["youtube"] = {"player_client": clients}
+
+    # --- PO Token provider (must never wipe the args set above) ---
+    _apply_po_args(opts["extractor_args"])
 
     # --- Cookies ---
     if os.path.exists(COOKIE_FILE):
         opts["cookiefile"] = COOKIE_FILE
-        logger.info(f"Using cookies from: {COOKIE_FILE}")
-    else:
-        logger.info("No cookie file found; public content only.")
 
     # --- Media type specific ---
     if media_type == "audio":
@@ -365,9 +617,19 @@ def build_ydl_opts(
             ]
         else:
             opts["format"] = "bestaudio[ext=m4a]/bestaudio"
-    else:
-        # Video: simple format that always works
+    elif media_type == "image":
+        # Instagram photo formats are a single JPEG; keep it simple.
         opts["format"] = "best"
+    else:
+        # Video: honour the requested height, then degrade gracefully.
+        try:
+            height = max(144, min(int(quality), 4320))
+        except (TypeError, ValueError):
+            height = 1080
+        opts["format"] = (
+            f"bv*[height<={height}]+ba/b[height<={height}]/"
+            f"bv*+ba/b/b[height<={height}]/best"
+        )
         opts["merge_output_format"] = "mp4"
 
     opts["progress_hooks"] = []
@@ -378,7 +640,7 @@ def build_ydl_opts(
 #  PROGRESS HANDLING
 # ============================================================
 
-def make_progress_hook(chat_id: int, status_message_id: int):
+def make_progress_hook(chat_id: int, status_message_id: int, index: int = 1, total: int = 1):
     last_update_time = [0.0]
 
     def progress_hook(d: dict) -> None:
@@ -389,34 +651,32 @@ def make_progress_hook(chat_id: int, status_message_id: int):
 
         status = d.get("status", "")
         if status == "downloading":
-            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            total_bytes = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             downloaded = d.get("downloaded_bytes", 0)
             speed = d.get("speed") or 0
             eta = d.get("eta") or 0
-            percent = d.get("_percent_str", "0%").strip()
 
-            if total > 0:
-                pct = int(downloaded / total * 100)
+            if total_bytes > 0:
+                pct = min(100, max(0, int(downloaded / total_bytes * 100)))
                 bar = _make_bar(pct)
-                size_mb = total / (1024 * 1024)
-                speed_str = (
-                    f"{speed / 1024 / 1024:.1f} MB/s"
-                    if speed else "calculating..."
-                )
-                eta_str = str(timedelta(seconds=eta)) if eta else "..."
+                size_mb = total_bytes / (1024 * 1024)
+                speed_str = f"{speed / 1024 / 1024:.1f} MB/s" if speed else "calculating..."
+                eta_str = str(timedelta(seconds=int(eta))) if eta else "..."
+                item = f"File {index} of {total}\n" if total > 1 else ""
                 text = (
                     f"<b>Downloading...</b>\n\n"
-                    f"{bar} <b>{percent}</b>\n"
+                    f"{item}{bar} <b>{pct}%</b>\n"
                     f"Size: <code>{size_mb:.1f} MB</code>\n"
-                    f"Speed: <code>{speed_str}</code>\n"
+                    f"Speed: <code>{esc(speed_str)}</code>\n"
                     f"ETA: <code>{eta_str}</code>"
                 )
                 _safe_edit(chat_id, status_message_id, text)
 
         elif status == "finished":
+            item = f"File {index} of {total}\n" if total > 1 else ""
             _safe_edit(
                 chat_id, status_message_id,
-                "<b>Processing...</b>\nMerging formats & converting...",
+                f"<b>Processing...</b>\n{item}Merging formats &amp; converting...",
             )
 
     return progress_hook
@@ -437,131 +697,250 @@ def _safe_edit(chat_id: int, message_id: int, text: str) -> None:
         pass
 
 
+def _safe_send(chat_id: int, text: str) -> None:
+    """Send a plain HTML message; never raise."""
+    try:
+        bot.send_message(chat_id, text, parse_mode="HTML")
+    except Exception:
+        try:
+            bot.send_message(chat_id, re.sub(r"<[^>]+>", "", text))
+        except Exception:
+            pass
+
+
 # ============================================================
-#  FILE SENDING WITH SIZE CHECK
+#  URL PROBE (what does this post actually contain?)
 # ============================================================
+
+def _probe_opts() -> Dict[str, Any]:
+    opts: Dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": False,
+        "ignoreerrors": False,
+        "skip_download": True,
+        "socket_timeout": 30,
+        "retries": 2,
+        "extractor_args": {},
+        "http_headers": {
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.instagram.com/",
+        },
+    }
+    _apply_po_args(opts["extractor_args"])
+    if os.path.exists(COOKIE_FILE):
+        opts["cookiefile"] = COOKIE_FILE
+    return opts
+
+
+def probe_url(url: str) -> Dict[str, Any]:
+    """Return {'ok', 'error', 'images', 'videos', 'total', 'is_image_post'}.
+
+    Used to show the user only the buttons that make sense for the link."""
+    result = {"ok": True, "error": "", "images": 0, "videos": 0, "total": 1, "is_image_post": False}
+    try:
+        with yt_dlp.YoutubeDL(_probe_opts()) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        result["ok"] = False
+        result["error"] = str(e)[:400]
+        return result
+
+    if info is None:
+        result["ok"] = False
+        result["error"] = "The extractor returned no data."
+        return result
+
+    entries = info.get("entries")
+    if not entries:
+        entries = [info]
+    entries = [e for e in entries if e]
+
+    result["total"] = len(entries)
+    for entry in entries:
+        if entry.get("is_image"):
+            result["images"] += 1
+        else:
+            result["videos"] += 1
+    result["is_image_post"] = result["images"] > 0 and result["videos"] == 0
+    return result
+
+
+# ============================================================
+#  FILE SENDING
+# ============================================================
+
+def _size_guard(chat_id: int, file_path: str) -> bool:
+    file_size = os.path.getsize(file_path)
+    if file_size <= MAX_FILE_SIZE_BYTES:
+        return True
+    size_mb = file_size / (1024 * 1024)
+    _safe_send(
+        chat_id,
+        f"<b>File too large!</b>\n\n"
+        f"Size: <code>{size_mb:.1f} MB</code>\n"
+        f"Telegram limit: <code>{MAX_FILE_SIZE_MB} MB</code>\n\n"
+        f"<i>Try a lower quality or the audio-only format.</i>",
+    )
+    return False
+
 
 def send_file_safely(
     chat_id: int, file_path: str, media_type: str, title: str = "Unknown",
 ) -> bool:
-    file_size = os.path.getsize(file_path)
-
-    if file_size > MAX_FILE_SIZE_BYTES:
-        size_mb = file_size / (1024 * 1024)
-        bot.send_message(
-            chat_id,
-            (
-                f"<b>File too large!</b>\n\n"
-                f"Size: <code>{size_mb:.1f} MB</code>\n"
-                f"Telegram limit: <code>{MAX_FILE_SIZE_MB} MB</code>\n\n"
-                f"<i>Try a lower quality or audio-only format.</i>"
-            ),
-        )
+    if not os.path.exists(file_path):
+        _safe_send(chat_id, "<b>File error:</b> the downloaded file is missing.")
+        return False
+    if not _size_guard(chat_id, file_path):
         return False
 
+    caption = esc(title)[:1000]
     try:
         with open(file_path, "rb") as f:
             if media_type == "audio":
-                bot.send_audio(chat_id, f, title=title[:64], timeout=120)
+                bot.send_audio(chat_id, f, title=str(title)[:64], timeout=UPLOAD_TIMEOUT)
+            elif media_type == "image":
+                bot.send_photo(chat_id, f, caption=caption, timeout=UPLOAD_TIMEOUT)
             else:
                 bot.send_video(
                     chat_id, f,
-                    caption=f"{title[:200]}",
-                    timeout=120,
+                    caption=caption,
+                    timeout=UPLOAD_TIMEOUT,
                     supports_streaming=True,
                 )
         return True
     except Exception as e:
         logger.error(f"Failed to send file to {chat_id}: {e}")
-        bot.send_message(
-            chat_id,
-            f"<b>Failed to send file.</b>\n<code>{str(e)[:500]}</code>",
-        )
+        # Retry once as a plain document - survives Telegram entity errors.
+        try:
+            with open(file_path, "rb") as f:
+                bot.send_document(chat_id, f, caption=caption, timeout=UPLOAD_TIMEOUT)
+            return True
+        except Exception as e2:
+            logger.error(f"Document fallback failed for {chat_id}: {e2}")
+            _safe_send(
+                chat_id,
+                f"<b>Failed to send the file.</b>\n<code>{esc(str(e2))[:400]}</code>",
+            )
+            return False
+
+
+PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".bmp"}
+VIDEO_EXTS = {".mp4", ".mov", ".webm", ".m4v", ".mkv", ".avi"}
+
+
+def _media_kind(file_path: str) -> str:
+    """photo | video | document - decides how Telegram should receive it."""
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in PHOTO_EXTS:
+        return "photo"
+    if ext in VIDEO_EXTS:
+        return "video"
+    return "document"
+
+
+def _send_single(chat_id: int, file_path: str, title: str) -> bool:
+    """Send one downloaded item, choosing the right Telegram method."""
+    if not os.path.exists(file_path) or not _size_guard(chat_id, file_path):
+        return False
+    caption = esc(title)[:1000]
+    kind = _media_kind(file_path)
+    try:
+        with open(file_path, "rb") as fh:
+            if kind == "video":
+                bot.send_video(chat_id, fh, caption=caption, timeout=UPLOAD_TIMEOUT,
+                               supports_streaming=True)
+            elif kind == "document":
+                bot.send_document(chat_id, fh, caption=caption, timeout=UPLOAD_TIMEOUT)
+            else:
+                bot.send_photo(chat_id, fh, caption=caption, timeout=UPLOAD_TIMEOUT)
+        return True
+    except Exception as e:
+        logger.warning(f"_send_single({kind}) failed for {file_path}: {e}")
+        try:
+            with open(file_path, "rb") as fh:
+                bot.send_document(chat_id, fh, caption=caption, timeout=UPLOAD_TIMEOUT)
+            return True
+        except Exception as e2:
+            logger.error(f"document fallback failed for {file_path}: {e2}")
+            return False
+
+
+def send_photos(chat_id: int, paths: List[str], title: str = "") -> bool:
+    """Send downloaded items as Telegram media groups (max 10 per group).
+
+    A carousel can mix photos and videos.  Telegram media groups accept
+    photo+video together but never documents, so documents are flushed on
+    their own and the rest go out as albums."""
+    if not paths:
         return False
 
+    ok = True
+    caption = esc(title)[:1000]
+    pending: List[str] = []
 
-# ============================================================
-#  YOUTUBE DOWNLOAD WITH RETRY
-# ============================================================
-
-def _try_download_youtube(
-    url: str, ydl_opts_base: Dict[str, Any], progress_hook, media_type: str
-) -> tuple:
-    """Try downloading YouTube URL with multiple player client fallbacks."""
-    last_error = None
-
-    for attempt, clients in enumerate(YOUTUBE_PLAYER_CLIENTS):
-        client_name = clients[0]
-        logger.info(
-            f"YouTube attempt {attempt + 1}/{len(YOUTUBE_PLAYER_CLIENTS)}: "
-            f"player_client={clients}"
-        )
-
-        opts = dict(ydl_opts_base)
-        opts["extractor_args"] = {"youtube": {"player_client": clients}}
-        opts["user_agent"] = _USER_AGENTS.get(client_name, _USER_AGENTS["web"])
-        opts["progress_hooks"] = [progress_hook]
-
+    def flush(items: List[str]) -> None:
+        nonlocal ok
+        if not items:
+            return
+        handles = []
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-
-                if info is None:
-                    raise ValueError("yt-dlp returned no info")
-
-                file_path = _determine_file_path(ydl, info, media_type)
-                video_title = (
-                    info.get("title")
-                    or info.get("fulltitle")
-                    or info.get("alt_title")
-                    or "Unknown"
-                )
-
-                if file_path and os.path.exists(file_path):
-                    return info, file_path, video_title
+            media = []
+            for index, path in enumerate(items):
+                fh = open(path, "rb")
+                handles.append(fh)
+                kwargs = {"caption": caption} if (index == 0 and caption) else {}
+                if _media_kind(path) == "video":
+                    media.append(InputMediaVideo(fh, **kwargs))
                 else:
-                    raise FileNotFoundError(
-                        f"Downloaded file not found: {file_path}"
-                    )
-
+                    media.append(InputMediaPhoto(fh, **kwargs))
+            bot.send_media_group(chat_id, media)
         except Exception as e:
-            last_error = e
-            error_str = str(e)
+            # A group failure is not itself a lost item: retry each file alone
+            # and only report failure if a single send fails too.
+            logger.warning(f"send_media_group failed ({e}); sending items one by one")
+            for path in items:
+                if not _send_single(chat_id, path, title or "Instagram post"):
+                    ok = False
+        finally:
+            for fh in handles:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
 
-            # If it's a bot detection or format error, try next client
-            if any(
-                keyword in error_str.lower()
-                for keyword in [
-                    "sign in to confirm",
-                    "not a bot",
-                    "returned no info",
-                    "requested format is not available",
-                    "video unavailable",
-                    "sign in",
-                    "login_required",
-                ]
-            ):
-                logger.warning(
-                    f"YouTube issue on client {client_name}, "
-                    f"trying next... ({error_str[:200]})"
-                )
-                continue
-            else:
-                raise
+    for path in paths:
+        if not os.path.exists(path):
+            ok = False
+            continue
+        if _media_kind(path) == "document":
+            if pending:
+                flush(pending)
+                pending = []
+            if not _send_single(chat_id, path, title or "Instagram post"):
+                ok = False
+            continue
+        if not _size_guard(chat_id, path):
+            ok = False
+            continue
+        pending.append(path)
+        if len(pending) >= 10:
+            flush(pending)
+            pending = []
 
-    raise last_error
+    flush(pending)
+    return ok
 
 
-def _determine_file_path(
-    ydl: yt_dlp.YoutubeDL, info: dict, media_type: str
-) -> Optional[str]:
+# ============================================================
+#  YT-DLP RUN HELPERS
+# ============================================================
+
+def _determine_file_path(ydl: yt_dlp.YoutubeDL, info: dict, media_type: str) -> Optional[str]:
     file_path = None
-
-    if "requested_downloads" in info and info["requested_downloads"]:
-        file_path = info["requested_downloads"][0].get("filepath", "")
-    elif "requested_formats" in info and info["requested_formats"]:
-        file_path = ydl.prepare_filename(info)
-    else:
+    if info.get("requested_downloads"):
+        file_path = info["requested_downloads"][0].get("filepath") or None
+    if not file_path:
         file_path = ydl.prepare_filename(info)
 
     if media_type == "audio" and file_path:
@@ -569,10 +948,142 @@ def _determine_file_path(
         for ext in (".mp3", ".m4a", ".opus", ".aac", ".webm"):
             candidate = base + ext
             if os.path.exists(candidate):
-                file_path = candidate
+                return candidate
+    return file_path
+
+
+def _collect_paths(ydl: yt_dlp.YoutubeDL, info: dict, media_type: str) -> List[str]:
+    """Gather every downloaded file (single post or carousel/playlist)."""
+    entries = info.get("entries")
+    if not entries:
+        entries = [info]
+
+    paths: List[str] = []
+    for entry in entries:
+        if not entry:
+            continue
+        path = None
+        if entry.get("requested_downloads"):
+            path = entry["requested_downloads"][0].get("filepath") or None
+        if not path:
+            try:
+                path = ydl.prepare_filename(entry)
+            except Exception:
+                path = None
+        if media_type == "audio" and path:
+            base = os.path.splitext(path)[0]
+            for ext in (".mp3", ".m4a", ".opus", ".aac", ".webm"):
+                candidate = base + ext
+                if os.path.exists(candidate):
+                    path = candidate
+                    break
+        if path and os.path.exists(path) and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _run_ytdlp(
+    url: str,
+    media_type: str,
+    quality: str,
+    clients: Optional[List[str]],
+    progress_hook=None,
+):
+    """One yt-dlp attempt. Returns (paths, title, ydl_info)."""
+    opts = build_ydl_opts(media_type, quality, clients=clients)
+    if progress_hook is not None:
+        opts["progress_hooks"] = [progress_hook]
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if info is None:
+            raise ValueError("yt-dlp returned no info")
+
+        paths = _collect_paths(ydl, info, media_type)
+        title = (
+            info.get("title")
+            or info.get("fulltitle")
+            or info.get("alt_title")
+            or (info.get("entries") or [{}])[0].get("title")
+            or "Unknown"
+        )
+
+        if not paths:
+            # last-chance single-file resolution
+            single = _determine_file_path(ydl, info, media_type)
+            if single and os.path.exists(single):
+                paths = [single]
+        if not paths:
+            raise FileNotFoundError("Download finished but no file was produced")
+
+    return paths, str(title), info
+
+
+def run_download(
+    url: str,
+    media_type: str,
+    quality: str,
+    progress_hook=None,
+):
+    """Download with retry/fallback strategy.
+
+    YouTube: walk the player-client tiers (PO-aware).  Any failure -
+    including a crash inside the PO token provider - moves on to the
+    next tier instead of killing the download.  Everything else runs
+    a single attempt, since player_client only affects YouTube."""
+    if _is_youtube_url(url):
+        tiers: List[Optional[List[str]]] = list(client_tiers())
+    else:
+        tiers = [None]
+
+    last_error: Optional[Exception] = None
+    tried: List[Optional[List[str]]] = []
+    while tiers:
+        clients = tiers.pop(0)
+        tried.append(clients)
+        label = tier_label(clients)
+        logger.info(f"yt-dlp attempt {len(tried)} [{label}]")
+        try:
+            return _run_ytdlp(url, media_type, quality, clients, progress_hook)
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                f"attempt {len(tried)} [{label}] {type(e).__name__}: {str(e)[:250]}"
+            )
+            if _is_po_crash(str(e)) and check_po_provider() in ("http", "script"):
+                # The provider itself blew up. Turn it off for good and
+                # walk the PO-free tiers instead of dying with it.
+                logger.warning("PO token provider crashed - switching it off")
+                _po_status["mode"] = "off"
+                _po_status["detail"] = "disabled after a provider crash"
+                tiers = [t for t in TIERS_WITHOUT_PO if t not in tried]
+                continue
+            if _is_impossible_error(str(e)):
                 break
 
-    return file_path
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Download failed for an unknown reason")
+
+
+def _is_impossible_error(error_text: str) -> bool:
+    """Errors where every other player-client will fail the same way."""
+    low = (error_text or "").lower()
+    return any(marker in low for marker in (
+        "private video",
+        "video unavailable",
+        "account associated with this video has been terminated",
+        "has been removed",
+        "not available in your country",
+    ))
+
+
+def _is_po_crash(error_text: str) -> bool:
+    low = (error_text or "").lower()
+    return any(marker in low for marker in (
+        "bgutil", "generate_once", "potoken", "po token", "pot provider",
+        "deno", "timeoutexpired",
+    ))
 
 
 # ============================================================
@@ -591,92 +1102,98 @@ def download_and_send(chat_id: int, status_msg_id: int) -> None:
         _safe_edit(chat_id, status_msg_id, "Session expired. Send a new link.")
         return
 
-    ydl_opts_base = build_ydl_opts(media_type, quality)
-    progress_hook = make_progress_hook(chat_id, status_msg_id)
-
-    file_path: Optional[str] = None
-    video_title: str = "Unknown"
+    paths: List[str] = []
+    title = "Unknown"
 
     try:
-        if _is_youtube_url(url):
-            _, file_path, video_title = _try_download_youtube(
-                url, ydl_opts_base, progress_hook, media_type
-            )
-        else:
-            ydl_opts_base["progress_hooks"] = [progress_hook]
-            with yt_dlp.YoutubeDL(ydl_opts_base) as ydl:
-                info = ydl.extract_info(url, download=True)
+        progress_hook = make_progress_hook(chat_id, status_msg_id)
+        paths, title, _info = run_download(url, media_type, quality, progress_hook)
 
-                if info is None:
-                    raise ValueError("yt-dlp returned no info")
-
-                file_path = _determine_file_path(ydl, info, media_type)
-                video_title = (
-                    info.get("title")
-                    or info.get("fulltitle")
-                    or info.get("alt_title")
-                    or "Unknown"
-                )
-
-                if not file_path or not os.path.exists(file_path):
-                    raise FileNotFoundError(
-                        f"Downloaded file not found: {file_path}"
-                    )
-
-        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-
-        _safe_edit(
-            chat_id, status_msg_id,
-            f"<b>Download complete!</b>\n"
-            f"Size: <code>{file_size_mb:.1f} MB</code>\n"
-            f"<b>Sending to Telegram...</b>",
+        total_mb = sum(os.path.getsize(p) for p in paths) / (1024 * 1024)
+        quality_label = (
+            f"{quality} kbps" if media_type == "audio" else (f"{quality}p" if media_type == "video" else "original")
         )
 
-        success = send_file_safely(chat_id, file_path, media_type, video_title)
+        if media_type == "image":
+            _safe_edit(
+                chat_id, status_msg_id,
+                f"<b>Download complete!</b>\n"
+                f"Photos: <code>{len(paths)}</code>\n"
+                f"Size: <code>{total_mb:.1f} MB</code>\n"
+                f"<b>Sending to Telegram...</b>",
+            )
+            ok = send_photos(chat_id, paths, title)
+        else:
+            _safe_edit(
+                chat_id, status_msg_id,
+                f"<b>Download complete!</b>\n"
+                f"Size: <code>{total_mb:.1f} MB</code>\n"
+                f"<b>Sending to Telegram...</b>",
+            )
+            ok = send_file_safely(chat_id, paths[0], media_type, title)
 
-        if success:
-            bot.send_message(
+        if ok:
+            noun = f"{len(paths)} photo(s)" if media_type == "image" else f"{total_mb:.1f} MB"
+            _safe_send(
                 chat_id,
-                (
-                    f"<b>Done!</b>\n\n"
-                    f"Title: {video_title[:200]}\n"
-                    f"Size: <code>{file_size_mb:.1f} MB</code>\n"
-                    f"Quality: <code>{quality}</code>\n\n"
-                    f"Send another link for a new download."
-                ),
+                f"<b>Done!</b>\n\n"
+                f"Title: <b>{esc(title)[:200]}</b>\n"
+                f"Sent: <code>{esc(noun)}</code>\n"
+                f"Quality: <code>{esc(quality_label)}</code>\n\n"
+                f"Send another link for a new download.",
             )
 
     except yt_dlp.utils.DownloadError as e:
         error_msg = str(e)[:800]
         logger.error(f"yt-dlp error for {chat_id}: {error_msg}")
-        _safe_edit(
-            chat_id, status_msg_id,
-            (
-                f"<b>Download failed.</b>\n\n"
-                f"<code>{error_msg}</code>\n\n"
-                f"<i>Try a different quality, or add YouTube cookies "
-                f"via YOUTUBE_COOKIES env var for better results.</i>"
-            ),
-        )
-    except FileNotFoundError as e:
+        _safe_edit(chat_id, status_msg_id, _friendly_error(error_msg))
+    except (FileNotFoundError, ValueError) as e:
         logger.error(f"File error for {chat_id}: {e}")
-        _safe_edit(
-            chat_id, status_msg_id,
-            f"<b>File error:</b> <code>{str(e)[:500]}</code>",
-        )
+        _safe_edit(chat_id, status_msg_id, f"<b>File error:</b>\n<code>{esc(str(e))[:500]}</code>")
     except Exception as e:
         logger.error(f"Unexpected error for {chat_id}: {e}", exc_info=True)
         _safe_edit(
             chat_id, status_msg_id,
-            f"<b>Unexpected error:</b>\n<code>{str(e)[:500]}</code>",
+            f"<b>Unexpected error:</b>\n<code>{esc(str(e))[:500]}</code>",
         )
     finally:
-        if file_path and os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except OSError as e:
-                logger.warning(f"Could not delete {file_path}: {e}")
+        for path in paths:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError as e:
+                    logger.warning(f"Could not delete {path}: {e}")
         _cleanup_download_dir()
+
+
+def _friendly_error(message: str) -> str:
+    """Turn a raw yt-dlp error into a short, actionable HTML message."""
+    low = message.lower()
+    hint = ""
+    if "sign in" in low or "not a bot" in low or "login_required" in low:
+        hint = (
+            "YouTube is asking for a login from this server.\n"
+            "Fix: refresh YOUTUBE_COOKIES in the Railway environment variables."
+        )
+    elif "requested format is not available" in low:
+        hint = "That quality does not exist for this video. Pick a lower quality."
+    elif "private video" in low or "members-only" in low:
+        hint = "The content is private or members-only. Cookies for that account are required."
+    elif "no video formats found" in low or "no video in this post" in low:
+        hint = "This post has no video. Use the Photos button instead."
+    elif "confirm" in low and "bot" in low:
+        hint = "Bot check. A PO token server plus fresh cookies is required on Railway."
+    elif "unable to download webpage" in low or "timed out" in low:
+        hint = "Network problem. Check YTDLP_PROXY or try again."
+
+    body = (
+        f"<b>Download failed.</b>\n\n"
+        f"<code>{esc(message[:400])}</code>"
+    )
+    if hint:
+        # hint is a static string defined above, safe as HTML
+        body += f"\n\n<i>{hint}</i>"
+    return body
 
 
 def _cleanup_download_dir() -> None:
@@ -684,12 +1201,11 @@ def _cleanup_download_dir() -> None:
         now = time.time()
         for fname in os.listdir(DOWNLOAD_DIR):
             fpath = os.path.join(DOWNLOAD_DIR, fname)
-            if os.path.isfile(fpath):
-                if now - os.path.getmtime(fpath) > 3600:
-                    try:
-                        os.remove(fpath)
-                    except OSError:
-                        pass
+            if os.path.isfile(fpath) and now - os.path.getmtime(fpath) > 3600:
+                try:
+                    os.remove(fpath)
+                except OSError:
+                    pass
     except Exception:
         pass
 
@@ -698,34 +1214,82 @@ def _cleanup_download_dir() -> None:
 #  BOT HANDLERS
 # ============================================================
 
-@bot.message_handler(commands=["start", "help"])
-def handle_start(message: telebot.types.Message) -> None:
-    chat_id = message.chat.id
-
+def _main_menu_markup() -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup(row_width=1)
     markup.add(
         InlineKeyboardButton("Supported Sites", callback_data="info_sites"),
         InlineKeyboardButton("How to Use", callback_data="info_usage"),
         InlineKeyboardButton("Cookie Setup", callback_data="info_cookies"),
     )
+    return markup
 
+
+def _format_markup(has_images: bool, image_count: int, has_video: bool) -> InlineKeyboardMarkup:
+    """Only offer the options that exist for this link."""
+    markup = InlineKeyboardMarkup(row_width=2)
+    if has_video:
+        markup.add(
+            InlineKeyboardButton("Video", callback_data="type_video"),
+            InlineKeyboardButton("Audio (MP3)", callback_data="type_audio"),
+        )
+    if has_images:
+        label = "Photos" if image_count <= 1 else f"Photos ({image_count})"
+        markup.add(InlineKeyboardButton(f"\U0001F4F7 {label}", callback_data="type_image"))
+    markup.add(InlineKeyboardButton("Back", callback_data="type_back"))
+    return markup
+
+
+def _quality_markup(media_type: str) -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup(row_width=2)
+    if media_type == "audio":
+        markup.add(
+            InlineKeyboardButton("MP3 128 kbps", callback_data="q_128"),
+            InlineKeyboardButton("MP3 192 kbps", callback_data="q_192"),
+            InlineKeyboardButton("MP3 256 kbps", callback_data="q_256"),
+            InlineKeyboardButton("MP3 320 kbps", callback_data="q_320"),
+        )
+    else:
+        markup.add(
+            InlineKeyboardButton("480p", callback_data="q_480"),
+            InlineKeyboardButton("720p", callback_data="q_720"),
+            InlineKeyboardButton("1080p", callback_data="q_1080"),
+            InlineKeyboardButton("1440p (2K)", callback_data="q_1440"),
+            InlineKeyboardButton("2160p (4K)", callback_data="q_2160"),
+        )
+    markup.add(InlineKeyboardButton("Back", callback_data="type_back"))
+    return markup
+
+
+def _start_download(chat_id: int, message_id: int) -> None:
+    thread = threading.Thread(
+        target=download_and_send,
+        args=(chat_id, message_id),
+        daemon=True,
+    )
+    thread.start()
+
+
+@bot.message_handler(commands=["start", "help"])
+def handle_start(message: telebot.types.Message) -> None:
+    chat_id = message.chat.id
     cookies_status = "Enabled" if os.path.exists(COOKIE_FILE) else "Not configured"
     ffmpeg_status = "Ready" if FFMPEG_AVAILABLE else "MISSING"
-    pot_status = "Configured" if PO_TOKEN_SERVER_URL else "Not configured"
+    po_mode = check_po_provider()
+    pot_status = po_mode if po_mode != "off" else "OFF"
 
     bot.send_message(
         chat_id,
         (
             f"<b>Welcome to Universal Media Downloader!</b>\n\n"
-            f"I can download from <b>YouTube, Instagram, TikTok, Twitter/X</b> "
-            f"and <b>1000+</b> other sites.\n\n"
+            f"I download from <b>YouTube, Instagram (video + photos + carousels), "
+            f"TikTok, Twitter/X</b> and <b>1000+</b> other sites.\n\n"
             f"<b>Just send me a link to get started!</b>\n\n"
             f"Max file size: <code>{MAX_FILE_SIZE_MB} MB</code>\n"
             f"Cookies: <code>{cookies_status}</code>\n"
             f"PO Token: <code>{pot_status}</code>\n"
             f"FFmpeg: <code>{ffmpeg_status}</code>"
         ),
-        reply_markup=markup,
+        reply_markup=_main_menu_markup(),
     )
 
 
@@ -735,29 +1299,30 @@ def handle_status(message: telebot.types.Message) -> None:
     with _states_lock:
         active_sessions = len(user_states)
 
-    cookies_status = (
-        f"Present: {COOKIE_FILE}" if os.path.exists(COOKIE_FILE)
-        else "Not found"
-    )
+    cookies_status = "Present" if os.path.exists(COOKIE_FILE) else "Not found"
     proxy_status = (
         "Connected" if (PROXY_ENABLED and not _proxy_needs_fallback)
         else "Fallback (direct)" if _proxy_needs_fallback
         else "Not set"
     )
-    ffmpeg_status = "Present" if FFMPEG_AVAILABLE else "MISSING"
-    pot_status = PO_TOKEN_SERVER_URL if PO_TOKEN_SERVER_URL else "Not configured"
 
-    status_text = (
-        f"<b>Bot Status</b>\n\n"
-        f"Bot: <b>Online</b>\n"
-        f"Active sessions: <code>{active_sessions}</code>\n"
-        f"FFmpeg: <code>{ffmpeg_status}</code>\n"
-        f"Cookies: <code>{cookies_status}</code>\n"
-        f"PO Token Server: <code>{pot_status}</code>\n"
-        f"Proxy: <code>{proxy_status}</code>\n"
-        f"Download dir: <code>{DOWNLOAD_DIR}</code>\n"
+    bot.send_message(
+        chat_id,
+        (
+            f"<b>Bot Status</b>\n\n"
+            f"Bot: <b>Online</b>\n"
+            f"yt-dlp: <code>{esc(yt_dlp.version.__version__)}</code>\n"
+            f"Instagram photos: <code>{'ON' if IG_PATCH_OK else 'OFF'}</code>\n"
+            f"Active sessions: <code>{active_sessions}</code>\n"
+            f"FFmpeg: <code>{'Present' if FFMPEG_AVAILABLE else 'MISSING'}</code>\n"
+            f"Cookies: <code>{esc(cookies_status)}</code>\n"
+            f"PO token provider: <code>{esc(check_po_provider())}</code>\n"
+            f"PO token detail: <code>{esc(_po_status['detail'])}</code>\n"
+            f"bgutil plugin: <code>{esc(BGUTIL_VERSION)}</code>\n"
+            f"Proxy: <code>{esc(proxy_status)}</code>\n"
+            f"Download dir: <code>{esc(DOWNLOAD_DIR)}</code>\n"
+        ),
     )
-    bot.send_message(chat_id, status_text)
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("info_"))
@@ -768,42 +1333,43 @@ def handle_info_callbacks(call: telebot.types.CallbackQuery) -> None:
     if data == "info_sites":
         text = (
             "<b>Supported Sites (partial list):</b>\n\n"
-            "- YouTube (videos, Shorts)\n"
-            "- Instagram (posts, Reels, Stories*)\n"
+            "- YouTube (videos, Shorts, audio)\n"
+            "- <b>Instagram</b> (posts, <b>photos</b>, <b>carousels</b>, Reels, Stories*)\n"
             "- TikTok (videos)\n"
-            "- Twitter/X (videos)\n"
+            "- Twitter/X (videos + images)\n"
             "- Facebook (videos)\n"
             "- Vimeo, Dailymotion, Twitch\n"
             "- Reddit, Bilibili, and 1000+ more\n\n"
-            "<i>* Requires cookies for private/authenticated content.</i>"
+            "<i>* Private/authenticated content needs cookies.</i>"
         )
     elif data == "info_usage":
         text = (
             "<b>How to Use:</b>\n\n"
-            "1. Send any video URL\n"
-            "2. Choose Video or Audio\n"
-            "3. Select quality\n"
-            "4. Wait for download & delivery\n\n"
+            "1. Send any media URL (surrounding text is fine)\n"
+            "2. Pick Video, Audio or Photos\n"
+            "3. Pick quality (photos skip this step)\n"
+            "4. Wait for the download\n\n"
             "<b>Commands:</b>\n"
-            "/start - Show welcome message\n"
-            "/status - Bot health check\n\n"
-            f"<b>Limits:</b> {MAX_FILE_SIZE_MB} MB per file\n"
+            "/start - welcome message\n"
+            "/status - bot health check\n\n"
+            f"<b>Limits:</b> {MAX_FILE_SIZE_MB} MB per file, "
+            f"{MAX_PHOTOS_PER_POST} photos per post\n"
             f"<b>Rate limit:</b> {MAX_REQUESTS_PER_WINDOW} per {RATE_LIMIT_WINDOW}s"
         )
     elif data == "info_cookies":
         text = (
             "<b>Cookie Setup Guide:</b>\n\n"
-            "For private Instagram, age-restricted YouTube, etc.\n\n"
+            "For private Instagram posts, age-restricted YouTube, and "
+            "datacenter IPs (Railway) that trigger bot checks.\n\n"
             "<b>Method 1 - Browser Extension:</b>\n"
             "Install 'Get cookies.txt LOCALLY' (Chrome/Firefox)\n"
-            "- Visit the site &amp; log in\n"
-            "- Export cookies.txt\n"
-            "- Place it at: ./cookies.txt\n\n"
-            "<b>Method 2 - Environment Variable (Railway):</b>\n"
-            "Set YOUTUBE_COOKIES in Railway env vars\n"
-            "with the full cookies.txt content\n\n"
-            "<b>Method 3 - yt-dlp command:</b>\n"
-            "yt-dlp --cookies-from-browser chrome URL"
+            "- Visit the site and log in\n"
+            "- Export cookies.txt\n\n"
+            "<b>Method 2 - Railway environment variable:</b>\n"
+            "Set <code>YOUTUBE_COOKIES</code> to the full cookies.txt content.\n\n"
+            "<b>Method 3 - Local file:</b>\n"
+            "Place cookies.txt next to bot.py and set <code>COOKIE_FILE</code>.\n\n"
+            "<i>Cookies expire - refresh them when downloads start failing.</i>"
         )
     else:
         text = "Unknown info."
@@ -811,44 +1377,37 @@ def handle_info_callbacks(call: telebot.types.CallbackQuery) -> None:
     try:
         bot.edit_message_text(text, chat_id, call.message.message_id, parse_mode="HTML")
         back_markup = InlineKeyboardMarkup()
-        back_markup.add(
-            InlineKeyboardButton("Back to Menu", callback_data="info_back")
-        )
+        back_markup.add(InlineKeyboardButton("Back to Menu", callback_data="info_back"))
         bot.edit_message_reply_markup(
             chat_id, call.message.message_id, reply_markup=back_markup
         )
     except Exception:
         pass
-
     bot.answer_callback_query(call.id)
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "info_back")
 def handle_back(call: telebot.types.CallbackQuery) -> None:
     chat_id = call.message.chat.id
-    markup = InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        InlineKeyboardButton("Supported Sites", callback_data="info_sites"),
-        InlineKeyboardButton("How to Use", callback_data="info_usage"),
-        InlineKeyboardButton("Cookie Setup", callback_data="info_cookies"),
-    )
     try:
         bot.edit_message_text(
             "<b>Universal Media Downloader</b>\n\nSelect a topic to learn more:",
-            chat_id,
-            call.message.message_id,
-            parse_mode="HTML",
-            reply_markup=markup,
+            chat_id, call.message.message_id,
+            parse_mode="HTML", reply_markup=_main_menu_markup(),
         )
     except Exception:
         pass
     bot.answer_callback_query(call.id)
 
 
+# ------------------------------------------------------------
+#  LINK RECEIVED
+# ------------------------------------------------------------
+
 @bot.message_handler(func=lambda message: True)
 def handle_link(message: telebot.types.Message) -> None:
     chat_id = message.chat.id
-    url = message.text.strip() if message.text else ""
+    raw_text = message.text or message.caption or ""
 
     if not check_rate_limit(chat_id):
         bot.reply_to(
@@ -859,13 +1418,15 @@ def handle_link(message: telebot.types.Message) -> None:
         return
 
     cleanup_stale_states()
+    cleanup_rate_map()
 
+    url = extract_url(raw_text)
     if not validate_url(url):
         bot.reply_to(
             message,
             (
-                "<b>Invalid or unsupported URL.</b>\n\n"
-                "Please send a direct link to a video/post from:\n"
+                "<b>No valid link found.</b>\n\n"
+                "Send a direct link to a video, photo or post from:\n"
                 "- YouTube, Instagram, TikTok, Twitter/X\n"
                 "- Vimeo, Facebook, Dailymotion, etc.\n\n"
                 "Example:\n<code>https://www.youtube.com/watch?v=dQw4w9WgXcQ</code>"
@@ -874,31 +1435,76 @@ def handle_link(message: telebot.types.Message) -> None:
         return
 
     url = normalize_url(url)
+    display_url = esc(url[:120]) + ("..." if len(url) > 120 else "")
 
     with _states_lock:
         user_states[chat_id] = {
             "url": url,
             "timestamp": datetime.now(),
-            "download_path": None,
+            "media_type": None,
+            "quality": None,
+            "images": 0,
+            "videos": 1,
         }
 
-    markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        InlineKeyboardButton("Video", callback_data="type_video"),
-        InlineKeyboardButton("Audio (MP3)", callback_data="type_audio"),
-    )
+    # Instagram: inspect the post so we only offer buttons that exist.
+    if _is_instagram_url(url):
+        status_msg = bot.reply_to(
+            message,
+            f"<b>Link received!</b>\n<code>{display_url}</code>\n\n"
+            f"<i>Checking the post...</i>",
+        )
+        probe = probe_url(url)
+        with _states_lock:
+            if chat_id in user_states:
+                user_states[chat_id]["images"] = probe.get("images", 0)
+                user_states[chat_id]["videos"] = probe.get("videos", 0)
 
-    display_url = url[:100] + ("..." if len(url) > 100 else "")
+        if not probe["ok"]:
+            _safe_edit(
+                chat_id, status_msg.message_id,
+                f"<b>Link received!</b>\n<code>{display_url}</code>\n\n"
+                f"<b>Could not read this post:</b>\n"
+                f"<code>{esc(probe['error'][:300])}</code>\n\n"
+                f"<i>It may be private, deleted, or need fresh cookies.</i>",
+            )
+            return
+
+        summary = []
+        if probe["images"]:
+            summary.append(f"Photos: <b>{probe['images']}</b>")
+        if probe["videos"]:
+            summary.append(f"Videos: <b>{probe['videos']}</b>")
+
+        summary_block = "\n".join(summary)
+        _safe_edit(
+            chat_id, status_msg.message_id,
+            f"<b>Link received!</b>\n<code>{display_url}</code>\n\n"
+            f"{summary_block}\n\n"
+            f"<b>Choose what to download:</b>",
+        )
+        try:
+            bot.edit_message_reply_markup(
+                chat_id, status_msg.message_id,
+                reply_markup=_format_markup(
+                    probe["images"] > 0, probe["images"], probe["videos"] > 0
+                ),
+            )
+        except Exception:
+            pass
+        return
+
     bot.reply_to(
         message,
-        (
-            f"<b>Link received!</b>\n"
-            f"<code>{display_url}</code>\n\n"
-            f"<b>Choose output format:</b>"
-        ),
-        reply_markup=markup,
+        f"<b>Link received!</b>\n<code>{display_url}</code>\n\n"
+        f"<b>Choose output format:</b>",
+        reply_markup=_format_markup(False, 0, True),
     )
 
+
+# ------------------------------------------------------------
+#  TYPE SELECTION
+# ------------------------------------------------------------
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("type_"))
 def handle_type_selection(call: telebot.types.CallbackQuery) -> None:
@@ -907,59 +1513,54 @@ def handle_type_selection(call: telebot.types.CallbackQuery) -> None:
 
     with _states_lock:
         if chat_id not in user_states:
-            bot.answer_callback_query(
-                call.id, "Session expired. Send a new link."
-            )
+            bot.answer_callback_query(call.id, "Session expired. Send a new link.")
+            return
+        state = user_states[chat_id]
+
+        if data == "type_back":
+            has_images = state.get("images", 0) > 0
+            image_count = state.get("images", 0)
+            has_video = state.get("videos", 1) > 0
+            markup = _format_markup(has_images, image_count, has_video)
+            text = "<b>Choose output format:</b>"
+        elif data == "type_image":
+            state["media_type"] = "image"
+            state["quality"] = "original"
+            markup = None
+            text = None
+        elif data == "type_video":
+            state["media_type"] = "video"
+            markup = _quality_markup("video")
+            text = "<b>Video</b> - Select quality:"
+        elif data == "type_audio":
+            state["media_type"] = "audio"
+            markup = _quality_markup("audio")
+            text = "<b>Audio (MP3)</b> - Select quality:"
+        else:
+            bot.answer_callback_query(call.id)
             return
 
-    if data == "type_video":
-        with _states_lock:
-            user_states[chat_id]["media_type"] = "video"
-
-        markup = InlineKeyboardMarkup(row_width=2)
-        markup.add(
-            InlineKeyboardButton("480p", callback_data="q_480"),
-            InlineKeyboardButton("720p", callback_data="q_720"),
-            InlineKeyboardButton("1080p", callback_data="q_1080"),
-            InlineKeyboardButton("1440p (2K)", callback_data="q_1440"),
-            InlineKeyboardButton("2160p (4K)", callback_data="q_2160"),
-            InlineKeyboardButton("Back", callback_data="type_back"),
-        )
+    try:
+        if data == "type_image":
+            bot.edit_message_text(
+                "<b>Starting download...</b>\n\n"
+                "Type: <b>Photos</b>\n\n<i>Please wait...</i>",
+                chat_id, call.message.message_id,
+            )
+            bot.answer_callback_query(call.id)
+            _start_download(chat_id, call.message.message_id)
+            return
         bot.edit_message_text(
-            "<b>Video</b> - Select quality:",
-            chat_id, call.message.message_id, reply_markup=markup,
+            text, chat_id, call.message.message_id, reply_markup=markup,
         )
-
-    elif data == "type_audio":
-        with _states_lock:
-            user_states[chat_id]["media_type"] = "audio"
-
-        markup = InlineKeyboardMarkup(row_width=2)
-        markup.add(
-            InlineKeyboardButton("MP3 128 kbps", callback_data="q_128"),
-            InlineKeyboardButton("MP3 192 kbps", callback_data="q_192"),
-            InlineKeyboardButton("MP3 256 kbps", callback_data="q_256"),
-            InlineKeyboardButton("MP3 320 kbps", callback_data="q_320"),
-            InlineKeyboardButton("Back", callback_data="type_back"),
-        )
-        bot.edit_message_text(
-            "<b>Audio (MP3)</b> - Select quality:",
-            chat_id, call.message.message_id, reply_markup=markup,
-        )
-
-    elif data == "type_back":
-        markup = InlineKeyboardMarkup(row_width=2)
-        markup.add(
-            InlineKeyboardButton("Video", callback_data="type_video"),
-            InlineKeyboardButton("Audio (MP3)", callback_data="type_audio"),
-        )
-        bot.edit_message_text(
-            "<b>Choose output format:</b>",
-            chat_id, call.message.message_id, reply_markup=markup,
-        )
-
+    except Exception:
+        pass
     bot.answer_callback_query(call.id)
 
+
+# ------------------------------------------------------------
+#  QUALITY SELECTION -> START
+# ------------------------------------------------------------
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("q_"))
 def handle_quality_selection(call: telebot.types.CallbackQuery) -> None:
@@ -968,34 +1569,27 @@ def handle_quality_selection(call: telebot.types.CallbackQuery) -> None:
 
     with _states_lock:
         if chat_id not in user_states:
-            bot.answer_callback_query(
-                call.id, "Session expired. Send a new link."
-            )
+            bot.answer_callback_query(call.id, "Session expired. Send a new link.")
             return
         user_states[chat_id]["quality"] = quality
-        media_type = user_states[chat_id].get("media_type", "video")
+        media_type = user_states[chat_id].get("media_type") or "video"
 
-    quality_label = (
-        f"{quality} kbps" if media_type == "audio" else f"{quality}p"
-    )
+    quality_label = f"{quality} kbps" if media_type == "audio" else f"{quality}p"
     media_label = "Audio" if media_type == "audio" else "Video"
 
-    bot.edit_message_text(
-        f"<b>Starting download...</b>\n\n"
-        f"Type: <b>{media_label}</b>\n"
-        f"Quality: <code>{quality_label}</code>\n\n"
-        f"<i>Please wait...</i>",
-        chat_id, call.message.message_id,
-    )
+    try:
+        bot.edit_message_text(
+            f"<b>Starting download...</b>\n\n"
+            f"Type: <b>{media_label}</b>\n"
+            f"Quality: <code>{quality_label}</code>\n\n"
+            f"<i>Please wait...</i>",
+            chat_id, call.message.message_id,
+        )
+    except Exception:
+        pass
 
     bot.answer_callback_query(call.id)
-
-    thread = threading.Thread(
-        target=download_and_send,
-        args=(chat_id, call.message.message_id),
-        daemon=True,
-    )
-    thread.start()
+    _start_download(chat_id, call.message.message_id)
 
 
 # ============================================================
@@ -1021,14 +1615,64 @@ def safe_polling() -> None:
 
 
 # ============================================================
+#  HEALTH ENDPOINT
+#  Railway (and any reverse proxy) can see the process is alive
+#  and read the PO token state without reading logs.
+# ============================================================
+
+def start_health_server() -> None:
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    port = int(os.getenv("PORT", "8080"))
+
+    class _Handler(BaseHTTPRequestHandler):
+        def _send(self, code: int, body: str) -> None:
+            data = body.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self) -> None:  # noqa: N802 (stdlib naming)
+            path = self.path.split("?", 1)[0]
+            if path in ("/", "/health", "/healthz"):
+                self._send(200, json.dumps({
+                    "status": "ok",
+                    "yt_dlp": yt_dlp.version.__version__,
+                    "bgutil_plugin": BGUTIL_VERSION,
+                    "po_provider": _po_status.get("mode") or "unchecked",
+                    "po_detail": _po_status.get("detail"),
+                    "instagram_photos": bool(IG_PATCH_OK),
+                }, ensure_ascii=False))
+            else:
+                self._send(404, '{"error":"not found"}')
+
+        def log_message(self, *_args) -> None:
+            pass  # keep the request log out of bot.log
+
+    def _serve() -> None:
+        try:
+            httpd = ThreadingHTTPServer(("0.0.0.0", port), _Handler)
+        except OSError as exc:
+            logger.warning(f"Health endpoint could not bind :{port} - {exc}")
+            return
+        logger.info(f"Health endpoint listening on :{port} (/, /health)")
+        httpd.serve_forever()
+
+    threading.Thread(target=_serve, daemon=True, name="health").start()
+
+
+# ============================================================
 #  ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":
     print("=" * 50)
     print("  Universal Media Downloader Bot")
-    print("  yt-dlp + Telegram - 2026 Edition")
+    print("  yt-dlp + Telegram (video, audio, photos)")
     print("=" * 50)
+    logger.info(f"yt-dlp version: {yt_dlp.version.__version__}")
     logger.info(f"Download directory: {DOWNLOAD_DIR}")
     logger.info(
         f"Cookie file: {COOKIE_FILE} "
@@ -1037,11 +1681,10 @@ if __name__ == "__main__":
     logger.info(
         f"Proxy: {'Connected' if (PROXY_ENABLED and not _proxy_needs_fallback) else 'Fallback/direct' if _proxy_needs_fallback else 'Not configured'}"
     )
-    logger.info(f"PO Token Server: {PO_TOKEN_SERVER_URL or 'Not configured'}")
+    check_po_provider()
     logger.info(f"FFmpeg: {'Available' if FFMPEG_AVAILABLE else 'MISSING'}")
     logger.info(f"Max file size: {MAX_FILE_SIZE_MB} MB")
-    logger.info(
-        f"Rate limit: {MAX_REQUESTS_PER_WINDOW} req/{RATE_LIMIT_WINDOW}s"
-    )
+    logger.info(f"Rate limit: {MAX_REQUESTS_PER_WINDOW} req/{RATE_LIMIT_WINDOW}s")
 
+    start_health_server()
     safe_polling()
