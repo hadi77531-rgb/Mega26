@@ -237,6 +237,13 @@ def _check_http_po_server() -> Tuple[bool, str]:
     version = str(data.get("version") or "")
     if not version:
         return False, "server did not report a version"
+    if BGUTIL_VERSION == "unknown":
+        # The provider is reachable; a silent "off" here just means
+        # YouTube fails later with a confusing bot-check error.
+        return True, (
+            f"HTTP server {version} (plugin version unknown - "
+            f"bgutil-ytdlp-pot-provider not importable)"
+        )
     if version.split(".", 1)[0] != BGUTIL_VERSION.split(".", 1)[0]:
         return False, (
             f"version mismatch - plugin {BGUTIL_VERSION} vs server {version}. "
@@ -280,15 +287,34 @@ def _check_script_po() -> Tuple[bool, str]:
 
 
 def check_po_provider(force: bool = False) -> str:
-    """Decide once whether the PO token provider is usable."""
+    """Pick the first usable PO token provider: HTTP server, then local script.
+
+    Trying only one and giving up is what silently turns YouTube off, so
+    every rejection is recorded and the next candidate still gets a turn.
+    """
     if _po_status["mode"] and not force:
         return _po_status["mode"]
+
+    rejected: List[str] = []
+    mode, detail, ok = "off", "no PO token provider available", False
+
     if PO_TOKEN_SERVER_URL:
-        ok, detail = _check_http_po_server()
-        mode = "http" if ok else "off"
-    else:
-        ok, detail = _check_script_po()
-        mode = "script" if ok else "off"
+        http_ok, http_detail = _check_http_po_server()
+        if http_ok:
+            mode, detail, ok = "http", http_detail, True
+        else:
+            rejected.append(f"http ({PO_TOKEN_SERVER_URL}): {http_detail}")
+
+    if not ok:
+        script_ok, script_detail = _check_script_po()
+        if script_ok:
+            mode, detail, ok = "script", script_detail, True
+        else:
+            rejected.append(f"script: {script_detail}")
+
+    if not ok:
+        detail = "; ".join(rejected) or "no PO token provider available"
+
     _po_status["mode"] = mode
     _po_status["detail"] = detail
     level = logging.INFO if ok else logging.WARNING
@@ -297,17 +323,25 @@ def check_po_provider(force: bool = False) -> str:
 
 
 def _apply_po_args(extractor_args: Dict[str, Any]) -> None:
-    """Fill extractor_args for the PO provider currently in use."""
+    """Fill extractor_args for the PO provider currently in use.
+
+    Every value MUST be a list. ``InfoExtractor._configuration_arg``
+    evaluates ``[x.lower() for x in val]``, so a plain string is iterated
+    character by character and ``base_url`` collapses to ``"h"``. The
+    plugin then cannot even reach ``/ping`` (``Unsupported url scheme:
+    ""``), reports the server unavailable, and NO PO token is requested -
+    which is exactly the "confirm you're not a bot" wall.
+    """
     mode = check_po_provider()
     if mode == "http":
-        extractor_args["youtubepot-bgutilhttp"] = {"base_url": PO_TOKEN_SERVER_URL}
-        extractor_args["youtubepot-bgutilscript"] = {"script_path": _PO_SCRIPT_OFF}
+        extractor_args["youtubepot-bgutilhttp"] = {"base_url": [PO_TOKEN_SERVER_URL]}
+        extractor_args["youtubepot-bgutilscript"] = {"script_path": [_PO_SCRIPT_OFF]}
     elif mode == "script":
-        extractor_args["youtubepot-bgutilscript"] = {"server_home": os.path.expanduser(
-            "~/bgutil-ytdlp-pot-provider/server")}
+        extractor_args["youtubepot-bgutilscript"] = {"server_home": [
+            os.path.expanduser("~/bgutil-ytdlp-pot-provider/server")]}
     else:
         # provider off - never let it spawn a runtime
-        extractor_args["youtubepot-bgutilscript"] = {"script_path": _PO_SCRIPT_OFF}
+        extractor_args["youtubepot-bgutilscript"] = {"script_path": [_PO_SCRIPT_OFF]}
 
 # --- Limits ---
 MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
@@ -1325,7 +1359,9 @@ def handle_status(message: telebot.types.Message) -> None:
     )
 
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("info_"))
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("info_") and call.data != "info_back"
+)
 def handle_info_callbacks(call: telebot.types.CallbackQuery) -> None:
     chat_id = call.message.chat.id
     data = call.data
@@ -1503,6 +1539,100 @@ def handle_link(message: telebot.types.Message) -> None:
 
 
 # ------------------------------------------------------------
+#  RECOVERY HELPERS
+#  An inline button can outlive the in-memory session: the process
+#  restarted, the session timed out, the user tapped an older
+#  message, or Telegram routed the callback to another instance.
+#  Doing nothing there is what makes a tap look broken - so rebuild
+#  the session from the button message itself, and always answer
+#  with something the user can see.
+# ------------------------------------------------------------
+
+def _url_from_status_text(text: str) -> str:
+    """Read the link back out of a 'Link received!' status message."""
+    if not text:
+        return ""
+    plain = html.unescape(re.sub(r"<[^>]+>", " ", text))
+    found = extract_url(plain)
+    if not found or not validate_url(found):
+        return ""
+    return normalize_url(found)
+
+
+def _recover_state(chat_id: int, call: telebot.types.CallbackQuery) -> bool:
+    """Rebuild user_states[chat_id] from the text of the tapped message."""
+    url = _url_from_status_text(getattr(call.message, "text", "") or "")
+    if not url:
+        return False
+
+    state = {
+        "url": url,
+        "timestamp": datetime.now(),
+        "media_type": None,
+        "quality": None,
+        "images": 0,
+        "videos": 1,
+    }
+    if _is_instagram_url(url):
+        # The counts only drive which buttons appear, but Back needs them.
+        probe = probe_url(url)
+        if probe.get("ok"):
+            state["images"] = probe.get("images", 0) or 0
+            state["videos"] = probe.get("videos", 1) or 1
+
+    with _states_lock:
+        user_states[chat_id] = state
+    logger.info(f"Recovered session for chat {chat_id} from message text: {url}")
+    return True
+
+
+def _edit_or_send(chat_id: int, message_id: int, text: str,
+                  markup: Optional[InlineKeyboardMarkup] = None) -> int:
+    """Edit the status message; if Telegram refuses, send a new one.
+
+    Returns the message id the next tap will carry. Swallowing the
+    exception here is exactly what makes a tap look like a no-op.
+    """
+    try:
+        bot.edit_message_text(
+            text, chat_id, message_id,
+            reply_markup=markup, parse_mode="HTML",
+        )
+        return message_id
+    except Exception as exc:
+        logger.warning(f"edit_message_text failed for chat {chat_id}: {exc}")
+    try:
+        sent = bot.send_message(
+            chat_id, text, reply_markup=markup, parse_mode="HTML",
+        )
+        return getattr(sent, "message_id", message_id)
+    except Exception as exc:
+        logger.error(f"could not answer chat {chat_id}: {exc}")
+        return message_id
+
+
+def _session_expired(call: telebot.types.CallbackQuery) -> None:
+    """Never leave a tap with neither a message nor a toast."""
+    _edit_or_send(
+        call.message.chat.id, call.message.message_id,
+        "<b>This selection has expired.</b>\n\n"
+        "Send the link again to start over.",
+    )
+    try:
+        bot.answer_callback_query(call.id, "Session expired. Send a new link.")
+    except Exception:
+        pass
+
+
+def _infer_media_type(quality: str) -> str:
+    """Audio qualities are 128-320 kbps, video heights are 480 and up."""
+    try:
+        return "audio" if int(quality) < 480 else "video"
+    except (TypeError, ValueError):
+        return "video"
+
+
+# ------------------------------------------------------------
 #  TYPE SELECTION
 # ------------------------------------------------------------
 
@@ -1511,10 +1641,19 @@ def handle_type_selection(call: telebot.types.CallbackQuery) -> None:
     chat_id = call.message.chat.id
     data = call.data
 
+    # Clear the button spinner first - recovery may take a while.
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
     with _states_lock:
-        if chat_id not in user_states:
-            bot.answer_callback_query(call.id, "Session expired. Send a new link.")
-            return
+        have_state = chat_id in user_states
+    if not have_state and not _recover_state(chat_id, call):
+        _session_expired(call)
+        return
+
+    with _states_lock:
         state = user_states[chat_id]
 
         if data == "type_back":
@@ -1537,25 +1676,18 @@ def handle_type_selection(call: telebot.types.CallbackQuery) -> None:
             markup = _quality_markup("audio")
             text = "<b>Audio (MP3)</b> - Select quality:"
         else:
-            bot.answer_callback_query(call.id)
             return
 
-    try:
-        if data == "type_image":
-            bot.edit_message_text(
-                "<b>Starting download...</b>\n\n"
-                "Type: <b>Photos</b>\n\n<i>Please wait...</i>",
-                chat_id, call.message.message_id,
-            )
-            bot.answer_callback_query(call.id)
-            _start_download(chat_id, call.message.message_id)
-            return
-        bot.edit_message_text(
-            text, chat_id, call.message.message_id, reply_markup=markup,
+    if data == "type_image":
+        target = _edit_or_send(
+            chat_id, call.message.message_id,
+            "<b>Starting download...</b>\n\n"
+            "Type: <b>Photos</b>\n\n<i>Please wait...</i>",
         )
-    except Exception:
-        pass
-    bot.answer_callback_query(call.id)
+        _start_download(chat_id, target)
+        return
+
+    _edit_or_send(chat_id, call.message.message_id, text, markup)
 
 
 # ------------------------------------------------------------
@@ -1567,29 +1699,37 @@ def handle_quality_selection(call: telebot.types.CallbackQuery) -> None:
     chat_id = call.message.chat.id
     quality = call.data.split("_", 1)[1]
 
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
     with _states_lock:
-        if chat_id not in user_states:
-            bot.answer_callback_query(call.id, "Session expired. Send a new link.")
-            return
-        user_states[chat_id]["quality"] = quality
-        media_type = user_states[chat_id].get("media_type") or "video"
+        have_state = chat_id in user_states
+    if not have_state and not _recover_state(chat_id, call):
+        _session_expired(call)
+        return
+
+    with _states_lock:
+        state = user_states[chat_id]
+        state["quality"] = quality
+        media_type = state.get("media_type")
+        if not media_type:
+            # Recovered session: a quality button is the only clue we have.
+            media_type = _infer_media_type(quality)
+            state["media_type"] = media_type
 
     quality_label = f"{quality} kbps" if media_type == "audio" else f"{quality}p"
     media_label = "Audio" if media_type == "audio" else "Video"
 
-    try:
-        bot.edit_message_text(
-            f"<b>Starting download...</b>\n\n"
-            f"Type: <b>{media_label}</b>\n"
-            f"Quality: <code>{quality_label}</code>\n\n"
-            f"<i>Please wait...</i>",
-            chat_id, call.message.message_id,
-        )
-    except Exception:
-        pass
-
-    bot.answer_callback_query(call.id)
-    _start_download(chat_id, call.message.message_id)
+    target = _edit_or_send(
+        chat_id, call.message.message_id,
+        f"<b>Starting download...</b>\n\n"
+        f"Type: <b>{media_label}</b>\n"
+        f"Quality: <code>{quality_label}</code>\n\n"
+        f"<i>Please wait...</i>",
+    )
+    _start_download(chat_id, target)
 
 
 # ============================================================
