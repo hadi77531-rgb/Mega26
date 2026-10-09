@@ -16,6 +16,8 @@ import sys
 import html
 import json
 import time
+import gzip
+import base64
 import shutil
 import logging
 import subprocess
@@ -174,19 +176,102 @@ else:
 # --- Cookie file for authenticated downloads ---
 COOKIE_FILE: str = os.path.expanduser(os.getenv("COOKIE_FILE", "cookies.txt"))
 
-# --- YouTube cookies from env var (Railway / cloud) ---
-YOUTUBE_COOKIES_TEXT: str = os.getenv("YOUTUBE_COOKIES", "")
-if YOUTUBE_COOKIES_TEXT:
+
+def _join_numbered(prefix: str) -> str:
+    """Join PREFIX_1 .. PREFIX_N in numeric order.
+
+    Cloud dashboards cap one variable at 1024 characters, so a full
+    cookies.txt has to be split across several variables.
+    """
+    parts: List[str] = []
+    n = 1
+    while True:
+        chunk = os.getenv(f"{prefix}_{n}", "")
+        if not chunk:
+            break
+        parts.append(chunk.strip())
+        n += 1
+    return "".join(parts)
+
+
+def _decode_cookie_blob(blob: str) -> str:
+    """Decode a gzip+base64 cookies blob; fall back to plain text."""
+    payload = blob.encode("ascii", "ignore")
     try:
-        _cookie_temp_file = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", delete=False, prefix="yt_cookies_"
-        ).name
-        with open(_cookie_temp_file, "w", encoding="utf-8") as f:
-            f.write(YOUTUBE_COOKIES_TEXT)
-        COOKIE_FILE = _cookie_temp_file
-        print(f"YouTube cookies loaded from YOUTUBE_COOKIES env var -> {_cookie_temp_file}")
-    except Exception as _e:
-        print(f"WARNING: Failed to write cookie temp file: {_e}")
+        return gzip.decompress(base64.b64decode(payload)).decode("utf-8", "replace")
+    except Exception:
+        pass
+    try:
+        return base64.b64decode(payload).decode("utf-8", "replace")
+    except Exception:
+        return blob
+
+
+def _fetch_cookies_url(url: str) -> str:
+    with urllib.request.urlopen(url, timeout=20) as resp:
+        return resp.read().decode("utf-8", "replace")
+
+
+def _looks_like_cookie_file(text: str) -> bool:
+    return "Netscape HTTP Cookie File" in text[:400] or ".youtube.com" in text
+
+
+def _install_cookies(text: str, source: str) -> bool:
+    """Write cookies to a temp file and point COOKIE_FILE at it.
+
+    ``newline=""`` keeps the bytes as they arrived: the default text
+    mode would translate every "\n" on Windows and a CRLF file coming
+    from a URL would end up as "\r\r\n", which reads back different
+    from the original.
+    """
+    global COOKIE_FILE
+    if not text or not _looks_like_cookie_file(text):
+        print(f"WARNING: cookies from {source} are not a Netscape cookie file - ignored")
+        return False
+    try:
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        handle = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, prefix="yt_cookies_",
+            encoding="utf-8", newline="",
+        )
+        with handle:
+            handle.write(text)
+        COOKIE_FILE = handle.name
+        n_rows = sum(1 for line in text.splitlines() if line and not line.startswith("#"))
+        print(f"YouTube cookies loaded from {source} -> {COOKIE_FILE} ({n_rows} rows)")
+        return True
+    except Exception as exc:
+        print(f"WARNING: failed to write cookie file from {source}: {exc}")
+        return False
+
+
+def _load_cloud_cookies() -> None:
+    """Resolve YouTube cookies from whichever source the platform allows.
+
+    Checked in order, first usable one wins:
+      1. YOUTUBE_COOKIES_URL     - a URL serving the cookies.txt file
+      2. YOUTUBE_COOKIES_B64_1..N (or YOUTUBE_COOKIES_B64) - gzip+base64
+      3. YOUTUBE_COOKIES         - raw text (Railway / local .env)
+    """
+    url = os.getenv("YOUTUBE_COOKIES_URL", "").strip()
+    if url:
+        try:
+            if _install_cookies(_fetch_cookies_url(url), "YOUTUBE_COOKIES_URL"):
+                return
+        except Exception as exc:
+            print(f"WARNING: could not fetch YOUTUBE_COOKIES_URL: {exc}")
+
+    blob = _join_numbered("YOUTUBE_COOKIES_B64") or os.getenv("YOUTUBE_COOKIES_B64", "").strip()
+    if blob:
+        if _install_cookies(_decode_cookie_blob(blob), "YOUTUBE_COOKIES_B64_*"):
+            return
+
+    raw = os.getenv("YOUTUBE_COOKIES", "")
+    if raw:
+        _install_cookies(raw, "YOUTUBE_COOKIES")
+
+
+_load_cloud_cookies()
 
 # --- PO Token server URL (bgutil HTTP server) ---
 PO_TOKEN_SERVER_URL: str = os.getenv("PO_TOKEN_SERVER_URL", "")

@@ -206,11 +206,58 @@ server and the bot in one container.
 |---|---|---|
 | `BOT_TOKEN` | ✅ | From `@BotFather` |
 | `YOUTUBE_COOKIES` | ✅ for Railway | Full `cookies.txt` content. Datacenter IPs trigger bot checks; cookies are the real fix, the PO token only helps. |
+| `YOUTUBE_COOKIES_B64_1..N` | alternative | Same file, gzipped + base64 and split, for hosts that cap one variable at 1024 characters (Back4App). |
+| `YOUTUBE_COOKIES_URL` | alternative | URL that serves the `cookies.txt` file; fetched once at startup. |
 | `YTDLP_PROXY` | optional | Proxy for downloads, e.g. `http://user:pass@host:port` |
 | `MAX_FILE_SIZE_MB` | optional | Telegram hard limit for bots is 50 MB |
 
 `start.sh` exports `PO_TOKEN_SERVER_URL=http://127.0.0.1:4416` for the bot and
 binds the PO Token server to **localhost only** (it is unauthenticated).
+
+### Back4App (and any host that caps a variable at 1024 characters)
+
+Back4App rejects an environment variable longer than **1024 characters**, so the
+raw `YOUTUBE_COOKIES` value never fits. Generate split variables instead:
+
+```bash
+python make_cookie_env.py cookies.txt
+```
+
+It gzips the file, base64-encodes it and prints one line per variable — every
+value is 1000 characters or less:
+
+```
+# cookies.txt : 4486 bytes
+# encoded     : 2731 characters -> 3 variable(s) of <= 1000
+
+YOUTUBE_COOKIES_B64_1=eJztvVuPm8j2Rf...
+YOUTUBE_COOKIES_B64_2=...
+YOUTUBE_COOKIES_B64_3=...
+```
+
+Paste **all** of them next to `BOT_TOKEN`. At startup the bot joins the chunks,
+gunzips them, writes a temp cookie file and reports it in the log:
+
+```
+YouTube cookies loaded from YOUTUBE_COOKIES_B64_* -> /tmp/yt_cookies_ab12cd.txt (23 rows)
+```
+
+| Flag | Effect |
+|---|---|
+| `--youtube-only` | Drop rows that are not YouTube auth cookies — fewer chunks |
+| `--chunk 900` | Smaller pieces if the host counts differently |
+| `--out cookies.env` | Also write the lines to a file |
+
+**Alternative — one short variable.** Host `cookies.txt` anywhere with an
+unguessable URL (a *secret* GitHub Gist works) and set:
+
+```
+YOUTUBE_COOKIES_URL=https://gist.githubusercontent.com/you/abc123/raw/cookies.txt
+```
+
+Priority at startup: `YOUTUBE_COOKIES_URL` → `YOUTUBE_COOKIES_B64_1..N` →
+`YOUTUBE_COOKIES`. A source that fails is skipped with a warning and the next
+one is tried.
 
 ### ⚠️ Version pinning (this was the main bug)
 
